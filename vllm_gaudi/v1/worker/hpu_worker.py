@@ -4,6 +4,7 @@ import contextlib
 import gc
 import math
 import os
+from copy import deepcopy
 import queue
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Optional, cast
@@ -32,13 +33,49 @@ from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerO
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
-from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights)
+from vllm_gaudi.v1.worker.hpu_model_runner import HPUModelRunner, _GDN_MAMBA_TYPES
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 from vllm_gaudi.extension.logger import logger as init_logger
 
 logger = init_logger()
 _QUANT_CONFIG_UNCHANGED = object()
+
+
+def _rebind_moe_expert_weights(model: nn.Module) -> None:
+    """Re-derive MoeMatmul.weight slices after model.to(device) (Sleep L1 / swap)."""
+    try:
+        from vllm_gaudi.v1.worker.hpu_model_runner import _rebind_moe_expert_weights as _runner_rebind
+
+        _runner_rebind(model)
+        return
+    except ImportError:
+        pass
+
+    from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOpBase
+
+    for module in model.modules():
+        moe_op = getattr(module, "moe_op", None)
+        if not isinstance(moe_op, VllmMixtureOfExpertsOpBase):
+            continue
+        n = moe_op.num_experts
+        w13_weight = getattr(module, "w13_weight", None)
+        w2_weight = getattr(module, "w2_weight", None)
+        if (w13_weight is not None and w2_weight is not None and w13_weight.dim() > 0 and w13_weight.shape[0] == n
+                and w2_weight.dim() > 0 and w2_weight.shape[0] == n):
+            for i in range(n):
+                moe_op.w13_list[i].set_weight(w13_weight[i])
+                moe_op.w2_list[i].set_weight(w2_weight[i])
+            w13_bias = getattr(module, "w13_bias", None)
+            w2_bias = getattr(module, "w2_bias", None)
+            if w13_bias is not None and w2_bias is not None:
+                for i in range(n):
+                    if hasattr(moe_op.w13_list[i], "set_bias"):
+                        moe_op.w13_list[i].set_bias(w13_bias[i])
+                    if hasattr(moe_op.w2_list[i], "set_bias"):
+                        moe_op.w2_list[i].set_bias(w2_bias[i])
+            if hasattr(moe_op, "_cache_weight_lists"):
+                moe_op._cache_weight_lists()
 
 
 def _model_runner_stash_enabled() -> bool:
@@ -51,17 +88,145 @@ def _model_runner_stash_enabled() -> bool:
 
 
 def _trim_host_memory() -> None:
+    """Return freed host pages to the OS (sleep L1 CPU staging / model swap)."""
+    gc.collect()
     gc.collect()
     with contextlib.suppress(Exception):
         import ctypes
 
         libc = ctypes.CDLL("libc.so.6")
         libc.malloc_trim(0)
+    # QA pods often use LD_PRELOAD=libtcmalloc; malloc_trim alone may not drop VmRSS.
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        tc = ctypes.CDLL("libtcmalloc.so.4")
+        tc.MallocExtension_ReleaseFreeMemory()
+    _trim_hpu_device_memory()
+
+
+def _trim_hpu_device_memory() -> None:
+    """Return cached HPU allocations to the driver (sleep/wake headroom)."""
+    if is_fake_hpu():
+        return
+    gc.collect()
+    hpu_mod = getattr(htorch, "hpu", None)
+    if hpu_mod is not None:
+        for name in ("clear_graph_cache", "clear_memory", "release_memory"):
+            fn = getattr(hpu_mod, name, None)
+            if callable(fn):
+                with contextlib.suppress(Exception):
+                    fn()
     with contextlib.suppress(Exception):
         torch.hpu.synchronize()
         torch.hpu.empty_cache()
-    with contextlib.suppress(Exception):
-        torch._C._host_emptyCache()
+        torch.hpu.synchronize()
+
+
+def _move_runner_model_to_cpu(runner: HPUModelRunner) -> None:
+    model = getattr(runner, "model", None)
+    if model is None:
+        return
+    model.to("cpu")
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if tensor.device.type != "cpu":
+            tensor.data = tensor.data.cpu()
+    _rebind_moe_expert_weights(model)
+
+
+def _unwrap_hpu_graph_for_sleep(runner: HPUModelRunner) -> bool:
+    from vllm_gaudi.v1.worker.hpu_model_runner import HpuModelAdapter
+
+    model = getattr(runner, "model", None)
+    if model is None or isinstance(model, HpuModelAdapter):
+        return False
+
+    inner: nn.Module | None = None
+    for attr in ("wrapped_module", "module", "orig_mod", "_orig_mod", "model"):
+        candidate = getattr(model, attr, None)
+        if isinstance(candidate, HpuModelAdapter):
+            inner = candidate
+            break
+    if inner is None:
+        return False
+
+    runner.model = inner
+    return True
+
+
+def _rewrap_hpu_graph_after_wake(runner: HPUModelRunner, vllm_config: VllmConfig) -> None:
+    from vllm_gaudi.v1.worker.hpu_model_runner import HpuModelAdapter, _maybe_wrap_in_hpu_graph
+
+    model = getattr(runner, "model", None)
+    if model is None or not isinstance(model, HpuModelAdapter):
+        return
+    if htorch.utils.internal.is_lazy():
+        runner.model = _maybe_wrap_in_hpu_graph(model, vllm_config=vllm_config)
+
+
+def _graph_reserved_fraction(enforce_eager: bool) -> float:
+    if enforce_eager:
+        return 0.0
+    try:
+        return float(os.environ.get("VLLM_GRAPH_RESERVED_MEM", "0.1"))
+    except ValueError:
+        return 0.1
+
+
+def _usable_kv_cache_bytes(free_hpu_bytes: int, gpu_memory_utilization: float, enforce_eager: bool) -> int:
+    graph_reserved = _graph_reserved_fraction(enforce_eager)
+    available = free_hpu_bytes * gpu_memory_utilization
+    return int(available * (1.0 - graph_reserved))
+
+
+def _release_runner_inference_workspace(runner: HPUModelRunner) -> None:
+    buckets = getattr(runner, "graphed_buckets", None)
+    if buckets is not None and hasattr(buckets, "clear"):
+        buckets.clear()
+    if getattr(runner, "defragmenter", None) is not None:
+        runner.defragmenter = None
+    _trim_hpu_device_memory()
+
+
+def _fit_kv_cache_config_for_wake(
+    kv_cache_config: KVCacheConfig,
+    *,
+    free_hpu_bytes: int,
+    gpu_memory_utilization: float,
+    enforce_eager: bool,
+) -> KVCacheConfig:
+    cfg = deepcopy(kv_cache_config)
+    old_blocks = int(cfg.num_blocks)
+    if old_blocks <= 0 or not cfg.kv_cache_tensors:
+        return cfg
+
+    total_kv_bytes = sum(int(t.size) for t in cfg.kv_cache_tensors)
+    if total_kv_bytes <= 0:
+        return cfg
+
+    usable = _usable_kv_cache_bytes(free_hpu_bytes, gpu_memory_utilization, enforce_eager)
+    usable = int(usable * 0.90)
+    if total_kv_bytes <= usable:
+        return cfg
+
+    new_blocks = max(1, (old_blocks * usable) // total_kv_bytes)
+    if new_blocks >= old_blocks:
+        return cfg
+
+    logger.warning(
+        "[HPUWorker] Wake KV shrink: num_blocks %d -> %d (KV %s -> ~%s, free HPU %s, budget %s)",
+        old_blocks,
+        new_blocks,
+        format_bytes(total_kv_bytes),
+        format_bytes((total_kv_bytes * new_blocks) // old_blocks),
+        format_bytes(free_hpu_bytes),
+        format_bytes(usable),
+    )
+    cfg.num_blocks = new_blocks
+    for tensor in cfg.kv_cache_tensors:
+        tensor.size = (int(tensor.size) * new_blocks) // old_blocks
+    return cfg
+
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import GrammarOutput, SchedulerOutput
@@ -112,6 +277,7 @@ class HPUWorker(WorkerBase):
         self.kv_cache_config = None
         self._model_runner_stash: dict[tuple[object, ...], HPUModelRunner] = {}
         self._model_runner_state_stash: dict[tuple[object, ...], dict[str, Any]] = {}
+        self._sleep_dropped_hpu_graph = False
 
     def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
@@ -142,22 +308,34 @@ class HPUWorker(WorkerBase):
         """Drop KV/state and release CPU weight tensors held by a model runner."""
         if runner is None:
             return
+        _release_runner_inference_workspace(runner)
         try:
             runner.defragmenter = None
             runner.kv_caches = []
             vllm_config = getattr(runner, "vllm_config", None)
             if vllm_config is not None:
                 forward_context = vllm_config.compilation_config.static_forward_context
-                for layer_name in forward_context:
+                for layer_name in list(forward_context.keys()):
                     with contextlib.suppress(Exception):
-                        forward_context[layer_name].kv_cache = None
+                        layer = forward_context[layer_name]
+                        if hasattr(layer, "kv_cache"):
+                            layer.kv_cache = None
+                forward_context.clear()
+            from vllm_gaudi.v1.worker.hpu_model_runner import release_model_host_weight_storage
+
             model = getattr(runner, "model", None)
+            targets: list[nn.Module] = []
             if model is not None:
-                for param in model.parameters():
-                    param.data = torch.empty(0, device=param.device)
-                for buffer in model.buffers():
-                    buffer.data = torch.empty(0, device=buffer.device)
-                runner.model = None
+                targets.append(model)
+            get_model_fn = getattr(runner, "get_model", None)
+            if callable(get_model_fn):
+                with contextlib.suppress(Exception):
+                    core = get_model_fn()
+                    if core is not None and core not in targets:
+                        targets.append(core)
+            for target in targets:
+                release_model_host_weight_storage(target)
+            runner.model = None
         except Exception as exc:
             logger.warning("[HPUWorker] model runner teardown partial failure: %s", exc)
         with contextlib.suppress(Exception):
@@ -228,6 +406,7 @@ class HPUWorker(WorkerBase):
         self.init_profiler()
 
     def shutdown(self):
+        logger.info("[HPUWorker] shutdown: evicting stash and destroying model runner(s)")
         self._evict_stashed_runners()
         if self.model_runner is not None:
             self._destroy_model_runner(self.model_runner)
@@ -235,8 +414,10 @@ class HPUWorker(WorkerBase):
         self.model_sleeping = False
         self.kv_cache_sleeping = False
         self.kv_cache_config = None
+        self._sleep_dropped_hpu_graph = False
         HPUBucketingManager.deactivate()
         _trim_host_memory()
+        logger.info("[HPUWorker] shutdown complete")
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
@@ -275,6 +456,7 @@ class HPUWorker(WorkerBase):
                         "model_sleeping": self.model_sleeping,
                         "kv_cache_sleeping": self.kv_cache_sleeping,
                         "kv_cache_config": self.kv_cache_config,
+                        "sleep_dropped_hpu_graph": self._sleep_dropped_hpu_graph,
                     }
                 self.model_runner = None
                 HPUBucketingManager.deactivate()
@@ -340,6 +522,7 @@ class HPUWorker(WorkerBase):
 
         self.model_sleeping = False
         self.kv_cache_sleeping = False
+        self._sleep_dropped_hpu_graph = False
 
     def restore_stashed_model(
         self,
@@ -371,6 +554,7 @@ class HPUWorker(WorkerBase):
         self.model_sleeping = bool(stashed_state.get("model_sleeping", True))
         self.kv_cache_sleeping = bool(stashed_state.get("kv_cache_sleeping", False))
         self.kv_cache_config = stashed_state.get("kv_cache_config", None)
+        self._sleep_dropped_hpu_graph = bool(stashed_state.get("sleep_dropped_hpu_graph", False))
 
         wake_tags: list[str] = []
         if self.model_sleeping:
@@ -681,17 +865,6 @@ class HPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         self.model_runner._dummy_run(1)  # type: ignore[union-attr]
 
-    def synchronize_device(self) -> None:
-        """Block until in-flight HPU work completes.
-
-        Overrides WorkerBase, whose default calls torch.accelerator.synchronize(). HPU registers as a
-        torch accelerator but rejects a device-wide multi-stream wait, so the base default raises
-        RuntimeError once EngineCore broadcasts "synchronize_device" on every pause (e.g. LLM.sleep()).
-        """
-        if is_fake_hpu():
-            return
-        torch.hpu.synchronize()
-
     def get_kv_connector_handshake_metadata(self) -> dict | None:
         """Get KV connector metadata from this worker if available."""
 
@@ -742,11 +915,13 @@ class HPUWorker(WorkerBase):
             logger.warning("Model was not loaded yet, skipping moving it to CPU")
         else:
             with HabanaMemoryProfiler() as m:
-                self.model_runner.model.to("cpu")
-                # Re-derive MoeMatmul.weight slices from the now-CPU params
-                _rebind_moe_expert_weights(self.model_runner.model)
-                gc.collect()
-                torch.hpu.synchronize()
+                _move_runner_model_to_cpu(self.model_runner)
+                dropped_graph = _unwrap_hpu_graph_for_sleep(self.model_runner)
+                if dropped_graph:
+                    self._sleep_dropped_hpu_graph = True
+                    logger.info("[HPUWorker] Dropped HPUGraph wrapper for sleep device release")
+                _trim_hpu_device_memory()
+                _trim_host_memory()
             msg = f"Moving model to CPU for sleep mode took {m.get_summary_string()}"
             logger.info(msg)
             self.model_sleeping = True
@@ -765,10 +940,14 @@ class HPUWorker(WorkerBase):
                 for layer_name in forward_context:
                     forward_context[layer_name].kv_cache = None
                 gc.collect()
-                torch.hpu.synchronize()
+                _trim_hpu_device_memory()
             msg = f"Discarding KV cache for sleep mode took {m.get_summary_string()}"
             logger.info(msg)
             self.kv_cache_sleeping = True
+
+        if self.model_runner is not None:
+            _release_runner_inference_workspace(self.model_runner)
+            HPUBucketingManager.deactivate()
 
     def wake_up(self, tags: list[str] | None = None) -> None:
         """Wake up the worker from sleep mode.
@@ -783,6 +962,8 @@ class HPUWorker(WorkerBase):
         if tags is None:
             tags = ["weights", "kv_cache"]
 
+        rewrap_graph_after_kv = False
+
         # Handle model - if model was loaded, move it back to HPU
         if "weights" in tags:
             if not self.model_sleeping:
@@ -793,11 +974,15 @@ class HPUWorker(WorkerBase):
             else:
                 with HabanaMemoryProfiler() as m:
                     self.model_runner.model.to(self.vllm_config.device_config.device)
-                    # Re-derive MoeMatmul.weight slices from the now-moved
-                    # parent FusedMoE registered params (w13_weight/w2_weight).
                     _rebind_moe_expert_weights(self.model_runner.model)
+                    if self._sleep_dropped_hpu_graph and "kv_cache" in tags and self.kv_cache_sleeping:
+                        rewrap_graph_after_kv = True
+                    elif self._sleep_dropped_hpu_graph:
+                        _rewrap_hpu_graph_after_wake(self.model_runner, self.vllm_config)
+                        self._sleep_dropped_hpu_graph = False
                     gc.collect()
-                    torch.hpu.synchronize()
+                    _trim_hpu_device_memory()
+                    _trim_host_memory()
                 msg = f"Waking up model, moving it back to HPU took {m.get_summary_string()}"
                 logger.info(msg)
                 self.model_sleeping = False
@@ -809,15 +994,36 @@ class HPUWorker(WorkerBase):
             elif self.kv_cache_config is None:
                 logger.warning("KV cache config is empty, skipping reinitializing KV cache")
             else:
+                _trim_hpu_device_memory()
+                free_hpu_bytes = torch.hpu.mem_get_info()[0] if not is_fake_hpu() else 0
+                kv_cfg = _fit_kv_cache_config_for_wake(
+                    self.kv_cache_config,
+                    free_hpu_bytes=free_hpu_bytes,
+                    gpu_memory_utilization=self.cache_config.gpu_memory_utilization,
+                    enforce_eager=bool(self.model_config.enforce_eager),
+                )
+                self.kv_cache_config = kv_cfg
+                if hasattr(self.cache_config, "num_gpu_blocks"):
+                    self.cache_config.num_gpu_blocks = kv_cfg.num_blocks
                 with HabanaMemoryProfiler() as m:
-                    self.model_runner.initialize_kv_cache(self.kv_cache_config)
+                    self.model_runner.initialize_kv_cache(kv_cfg)
                     self.model_runner.defragmenter = OnlineDefragmenter(self.model_runner.kv_caches,
                                                                         self.model_runner.block_size)
                     gc.collect()
-                    torch.hpu.synchronize()
+                    _trim_hpu_device_memory()
                 msg = f"Waking up KV cache, reinitializing it took {m.get_summary_string()}"
                 logger.info(msg)
                 self.kv_cache_sleeping = False
+
+        if rewrap_graph_after_kv and self.model_runner is not None:
+            with HabanaMemoryProfiler() as m:
+                _rewrap_hpu_graph_after_wake(self.model_runner, self.vllm_config)
+                self._sleep_dropped_hpu_graph = False
+                _trim_hpu_device_memory()
+            logger.info(
+                "Restored HPUGraph wrapper after KV wake took %s",
+                m.get_summary_string(),
+            )
 
 
 def init_worker_distributed_environment(

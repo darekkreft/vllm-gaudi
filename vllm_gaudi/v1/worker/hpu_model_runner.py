@@ -529,6 +529,51 @@ def _dedup_moe_op_weights(model: torch.nn.Module) -> None:
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
 
 
+def _zero_tensor_storage(t: torch.Tensor) -> None:
+    t.data = torch.empty(0, dtype=t.dtype, device=t.device)
+
+
+def _purge_moe_op_expert_tensors(model: torch.nn.Module) -> None:
+    """Release per-expert ``MoeMatmul`` storages (often the live weight copy after INC)."""
+    for module in model.modules():
+        moe_op = getattr(module, "moe_op", None)
+        if moe_op is None:
+            continue
+        for list_name in ("w13_list", "w2_list"):
+            weight_list = getattr(moe_op, list_name, None)
+            if weight_list is None:
+                continue
+            for item in weight_list:
+                w = getattr(item, "weight", None)
+                if isinstance(w, torch.Tensor):
+                    item.weight = torch.empty(0, dtype=w.dtype, device=w.device)
+                b = getattr(item, "bias", None)
+                if isinstance(b, torch.Tensor):
+                    item.bias = torch.empty(0, dtype=b.dtype, device=b.device)
+        for cache_attr in (
+            "_cached_w13_views",
+            "_cached_w2_views",
+            "_cached_w13_bias_views",
+            "_cached_w2_bias_views",
+        ):
+            if hasattr(moe_op, cache_attr):
+                setattr(moe_op, cache_attr, None)
+
+
+def release_model_host_weight_storage(model: torch.nn.Module | None) -> None:
+    """Drop weight/buffer storages so host RSS can fall after sleep-on-CPU + destroy."""
+    if model is None:
+        return
+    _purge_moe_op_expert_tensors(model)
+    _dedup_moe_op_weights(model)
+    for param in list(model.parameters()):
+        _zero_tensor_storage(param)
+    for buffer in list(model.buffers()):
+        _zero_tensor_storage(buffer)
+    with contextlib.suppress(Exception):
+        model.to("meta")
+
+
 class BucketingFailedException(Exception):
     pass
 

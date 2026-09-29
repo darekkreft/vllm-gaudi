@@ -338,15 +338,23 @@ def patch_nixl_utils_for_hpu():
 
 def shutdown_llm(llm: Any) -> None:
     """Shut down a v1 ``LLM`` so workers release HPU and host weight memory."""
+    import contextlib
+
     if llm is None:
         return
     if hasattr(llm, "shutdown") and callable(llm.shutdown):
         llm.shutdown()
         return
     engine = getattr(llm, "llm_engine", None) or getattr(getattr(llm, "model", None), "llm_engine", None)
-    if engine is not None and hasattr(engine, "shutdown") and callable(engine.shutdown):
+    if engine is None:
+        return
+    # Tear down HPU workers before EngineCore drops executor / dist state.
+    if hasattr(engine, "collective_rpc") and callable(engine.collective_rpc):
+        with contextlib.suppress(Exception):
+            engine.collective_rpc("shutdown")
+    if hasattr(engine, "shutdown") and callable(engine.shutdown):
         engine.shutdown()
         return
-    engine_core = getattr(engine, "engine_core", None) if engine is not None else None
+    engine_core = getattr(engine, "engine_core", None)
     if engine_core is not None and hasattr(engine_core, "shutdown"):
         engine_core.shutdown()

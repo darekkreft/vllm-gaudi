@@ -33,6 +33,17 @@ def _hpu_get_memory_info(device=None) -> tuple[int, int]:
 
 torch.accelerator.get_memory_info = _hpu_get_memory_info
 
+
+def _hpu_noop_empty_host_cache() -> None:
+    """Avoid SIGSEGV from ``at::accelerator::emptyHostCache()`` on Habana builds."""
+    return
+
+
+if hasattr(torch.accelerator, "empty_host_cache"):
+    torch.accelerator.empty_host_cache = _hpu_noop_empty_host_cache
+if hasattr(torch._C, "_host_emptyCache"):
+    torch._C._host_emptyCache = _hpu_noop_empty_host_cache
+
 QWEN3_5_HYBRID_ARCHS = frozenset({
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
@@ -116,6 +127,15 @@ class HpuPlatform(Platform):
     @classmethod
     def manual_seed_all(cls, seed: int) -> None:
         torch.hpu.random.manual_seed_all(seed)
+
+    @classmethod
+    def empty_cache(cls) -> None:
+        """Release HPU device cache without calling broken host-cache APIs."""
+        try:
+            torch.hpu.synchronize()
+            torch.hpu.empty_cache()
+        except Exception:
+            pass
 
     @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:

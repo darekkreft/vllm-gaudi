@@ -12,14 +12,6 @@ Currently:
 * ``torch._C._host_emptyCache`` — does not exist on HPU; we install a no-op
   stub to prevent ``AttributeError`` in ``cleanup_dist_env_and_memory``.
 
-* ``torch.accelerator.empty_host_cache`` — vllm PR #51107 switched
-  ``cleanup_dist_env_and_memory`` from ``torch._C._host_emptyCache()`` to
-  ``torch.accelerator.empty_host_cache()``.  On torch>=2.9 the attribute exists,
-  so vllm's ``except AttributeError`` guard no longer catches it; the call
-  dispatches to ``at::accelerator::emptyHostCache()``, which has no HPU host-cache
-  hook and segfaults at teardown.  We replace it with a no-op (sibling of the
-  ``empty_cache`` patch above).
-
 * ``vllm.distributed.parallel_state.cleanup_dist_env_and_memory`` — upstream
   (since vllm PR #34328) calls ``torch.accelerator.empty_cache()``, which
   requires the device's allocator to be a ``c10::DeviceAllocator``.  We
@@ -138,14 +130,10 @@ def _hpu_accelerator_empty_cache() -> None:
 
 
 def _hpu_accelerator_empty_host_cache() -> None:
-    """HPU-safe replacement for ``torch.accelerator.empty_host_cache()``.
+    """No-op for ``torch.accelerator.empty_host_cache()`` / ``emptyHostCache``.
 
-    HPU has no host-cache-release hook; the upstream C++ path
-    (``at::accelerator::emptyHostCache()``) segfaults at teardown. vLLM PR
-    #51107 swapped ``torch._C._host_emptyCache()`` for
-    ``torch.accelerator.empty_host_cache()`` in ``cleanup_dist_env_and_memory``,
-    and on torch>=2.9 the attribute exists so the upstream
-    ``except AttributeError`` guard no longer catches it.  Make it a no-op.
+    On Habana PyTorch builds, ``at::accelerator::emptyHostCache()`` can
+    SIGSEGV during LLM teardown after Sleep L1 destroy.
     """
     return
 
@@ -243,11 +231,8 @@ def _hpu_cleanup_dist_env_and_memory(shutdown_ray: bool = False) -> None:
     empty_cache = current_platform.empty_cache
     if empty_cache is not None:
         empty_cache()
-    try:
-        if not current_platform.is_cpu():
-            torch._C._host_emptyCache()
-    except AttributeError:
-        parallel_state.logger.warning("torch._C._host_emptyCache() only available in Pytorch >=2.5")
+    # Do not call torch._C._host_emptyCache() on HPU — it routes to
+    # at::accelerator::emptyHostCache() and can segfault on teardown.
 
 
 def _hpu_gather_logprobs(
@@ -299,8 +284,7 @@ def _patch_gather_logprobs() -> None:
     if "mark_unbacked" not in inspect.getsource(_sampler_mod.Sampler.gather_logprobs):
         return  # Not affected — older vLLM without PR #38933.
 
-    _sampler_mod.Sampler.gather_logprobs = staticmethod(  # type: ignore[method-assign]
-        _hpu_gather_logprobs)
+    _sampler_mod.Sampler.gather_logprobs = staticmethod(_hpu_gather_logprobs)
 
 
 def _hpu_batched_count_greater_than(x: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
@@ -690,27 +674,6 @@ def _patch_free_blocks() -> None:
 _CACHED_FSDPA_OP = None
 
 
-def _ensure_fsdpa_cached() -> None:
-    """Eagerly initialize the FusedSDPA operator cache.
-
-    Must be called BEFORE torch.compile traces _hpu_sdpa_attention_forward,
-    otherwise dynamo creates a guard on `_CACHED_FSDPA_OP is None` which
-    fails at runtime and triggers recompilation.
-
-    Called from hpu_model_runner.py during model initialization.
-    """
-    global _CACHED_FSDPA_OP
-    if _CACHED_FSDPA_OP is not None:
-        return
-    try:
-        from vllm_gaudi.extension.utils import ModuleFusedSDPA
-        import vllm_gaudi.extension.kernels as kernels
-        HPUFusedSDPA = kernels.fsdpa()
-        _CACHED_FSDPA_OP = ModuleFusedSDPA(HPUFusedSDPA)
-    except Exception:
-        pass
-
-
 def _hpu_sdpa_attention_forward(
     module: torch.nn.Module,
     query: torch.Tensor,
@@ -782,12 +745,12 @@ def _hpu_sdpa_attention_forward(
             pass
 
     if _use_hpu_fsdpa and _config is not None:
-        # _CACHED_FSDPA_OP is initialized eagerly by _ensure_fsdpa_cached()
-        # before torch.compile traces this function. This avoids the dynamo
-        # guard on `_CACHED_FSDPA_OP is None` that would trigger recompilation.
-        _ensure_fsdpa_cached()
+        global _CACHED_FSDPA_OP
         if _CACHED_FSDPA_OP is None:
-            raise RuntimeError("FSDPA op failed to initialize")
+            from vllm_gaudi.extension.utils import ModuleFusedSDPA
+            import vllm_gaudi.extension.kernels as kernels
+            HPUFusedSDPA = kernels.fsdpa()
+            _CACHED_FSDPA_OP = ModuleFusedSDPA(HPUFusedSDPA)
 
         softmax_mode = "fp32" if _config.fp32_softmax else "fast"
         attn_output = _CACHED_FSDPA_OP(
@@ -838,46 +801,16 @@ def _patch_sdpa_attention_forward() -> None:
     except ImportError:
         pass  # transformers version without this module
 
-    # Eagerly initialize the operator cache at patch-registration time,
-    # before torch.compile traces the function. Same pattern as hpu_attn.py
-    # which calls kernels.fsdpa() in __init__.
-    _ensure_fsdpa_cached()
-
-
-def _patch_inc_quantization_config() -> None:
-    """Register the HPU ``_FakeINCConfig`` as the resolver for ``inc``.
-
-    The Gaudi runtime-INC (Intel Neural Compressor) flow calibrates fp8 scales
-    at runtime and ships no on-disk config, so resolving ``inc`` to vLLM's
-    native ``INCConfig`` (whose ``get_config_filenames()`` expects
-    ``quantization_config.json``) makes ``get_quant_config`` raise ``Cannot find
-    the config file for inc`` — surfacing as a ``VllmConfig`` ValidationError
-    during ``create_engine_config`` (exposed by upstream vllm#51695). The
-    existing ``ops`` shim on ``get_quantization_config`` is order-sensitive;
-    registering via the public ``register_quantization_config`` API is immune to
-    import order because ``get_quantization_config`` merges the registry on
-    every call. ``inc`` is already in ``QUANTIZATION_METHODS``, so this only
-    overrides the config class and does not touch ``current_platform``.
-    """
-    from vllm.model_executor.layers.quantization import register_quantization_config
-
-    from vllm_gaudi.extension.quant import _FakeINCConfig
-
-    register_quantization_config("inc")(_FakeINCConfig)
-
 
 def apply() -> None:
     """Install all HPU runtime monkey-patches."""
-    # --- torch.accelerator.empty_cache ---
+    # --- torch.accelerator.empty_cache / empty_host_cache ---
     torch.accelerator.empty_cache = _hpu_accelerator_empty_cache
-
-    # --- torch.accelerator.empty_host_cache ---
     if hasattr(torch.accelerator, "empty_host_cache"):
         torch.accelerator.empty_host_cache = _hpu_accelerator_empty_host_cache
 
-    # --- torch._C._host_emptyCache ---
-    if not hasattr(torch._C, "_host_emptyCache"):
-        torch._C._host_emptyCache = lambda: None
+    # --- torch._C._host_emptyCache (always no-op on HPU; native call segfaults) ---
+    torch._C._host_emptyCache = _hpu_accelerator_empty_host_cache
 
     _patch_hf3fs_mock_client_for_cpu_only()
 
@@ -897,6 +830,12 @@ def apply() -> None:
 
     def _load_general_with_hpu_patches():
         _original_load_general()
+        try:
+            from vllm_gaudi.v1.engine.core_patch import install_gaudi_engine_shutdown_patch
+
+            install_gaudi_engine_shutdown_patch()
+        except Exception as exc:
+            logger.warning("[HPU] engine shutdown patch skipped: %s", exc)
         _patch_cleanup_dist_env_and_memory()
         _patch_batched_count_greater_than()
         _patch_gather_logprobs()
@@ -907,7 +846,6 @@ def apply() -> None:
         _patch_mamba_bind_kv_cache()
         _patch_free_blocks()
         _patch_sdpa_attention_forward()
-        _patch_inc_quantization_config()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 

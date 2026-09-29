@@ -96,6 +96,26 @@ def test_shutdown_destroy_active_and_stashed() -> None:
     assert stashed.model is None
 
 
+def test_trim_host_memory_runs_gc_malloc_trim_and_tcmalloc_release() -> None:
+    mock_libc = MagicMock()
+    mock_tc = MagicMock()
+
+    def _cdll(name: str) -> MagicMock:
+        if "tcmalloc" in name:
+            return mock_tc
+        return mock_libc
+
+    with patch.object(hpu_worker_mod.gc, "collect") as collect:
+        with patch("ctypes.CDLL", side_effect=_cdll):
+            with patch.object(hpu_worker_mod, "_trim_hpu_device_memory") as trim_hpu:
+                hpu_worker_mod._trim_host_memory()
+
+    assert collect.call_count == 2
+    mock_libc.malloc_trim.assert_called_once_with(0)
+    mock_tc.MallocExtension_ReleaseFreeMemory.assert_called_once_with()
+    trim_hpu.assert_called_once()
+
+
 def test_load_model_evicts_stash_before_new_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     worker = _make_worker()
     stashed = _FakeRunner("old")
