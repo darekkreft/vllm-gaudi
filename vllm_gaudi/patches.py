@@ -802,6 +802,27 @@ def _patch_sdpa_attention_forward() -> None:
         pass  # transformers version without this module
 
 
+def _patch_worker_synchronize_device() -> None:
+    """``WorkerBase.synchronize_device`` uses ``torch.accelerator.synchronize()``.
+
+    HPU rejects device-wide multi-stream sync (LLM.sleep / pause_scheduler).
+    Patch the base method so every worker uses ``torch.hpu.synchronize()``.
+    """
+    from vllm.v1.worker import worker_base as _worker_base
+    from vllm_gaudi.utils import is_fake_hpu
+
+    def _hpu_worker_synchronize_device(self) -> None:
+        if is_fake_hpu():
+            return
+        torch.hpu.synchronize()
+
+    _hpu_worker_synchronize_device.__name__ = "synchronize_device"
+    _hpu_worker_synchronize_device.__doc__ = (
+        "HPU plugin patch for WorkerBase.synchronize_device (Sleep L1 pause)."
+    )
+    _worker_base.WorkerBase.synchronize_device = _hpu_worker_synchronize_device
+
+
 def apply() -> None:
     """Install all HPU runtime monkey-patches."""
     # --- torch.accelerator.empty_cache / empty_host_cache ---
@@ -846,6 +867,7 @@ def apply() -> None:
         _patch_mamba_bind_kv_cache()
         _patch_free_blocks()
         _patch_sdpa_attention_forward()
+        _patch_worker_synchronize_device()
 
     _plugins_mod.load_general_plugins = _load_general_with_hpu_patches
 
