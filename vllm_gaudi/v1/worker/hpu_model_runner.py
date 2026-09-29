@@ -529,6 +529,76 @@ def _dedup_moe_op_weights(model: torch.nn.Module) -> None:
             param.data = torch.empty(0, dtype=param.dtype, device=param.device)
 
 
+def _zero_tensor_storage(t: torch.Tensor) -> None:
+    t.data = torch.empty(0, dtype=t.dtype, device=t.device)
+
+
+def _purge_moe_op_expert_tensors(model: torch.nn.Module) -> None:
+    """Release per-expert ``MoeMatmul`` storages (often the live weight copy after INC)."""
+    for module in model.modules():
+        moe_op = getattr(module, "moe_op", None)
+        if moe_op is None:
+            continue
+        for list_name in ("w13_list", "w2_list"):
+            weight_list = getattr(moe_op, list_name, None)
+            if weight_list is None:
+                continue
+            for item in weight_list:
+                w = getattr(item, "weight", None)
+                if isinstance(w, torch.Tensor):
+                    item.weight = torch.empty(0, dtype=w.dtype, device=w.device)
+                b = getattr(item, "bias", None)
+                if isinstance(b, torch.Tensor):
+                    item.bias = torch.empty(0, dtype=b.dtype, device=b.device)
+        for cache_attr in (
+            "_cached_w13_views",
+            "_cached_w2_views",
+            "_cached_w13_bias_views",
+            "_cached_w2_bias_views",
+        ):
+            if hasattr(moe_op, cache_attr):
+                setattr(moe_op, cache_attr, None)
+
+
+def release_model_host_weight_storage(model: torch.nn.Module | None) -> None:
+    """Drop weight/buffer storages so host RSS can fall after sleep-on-CPU + destroy."""
+    if model is None:
+        return
+    _purge_moe_op_expert_tensors(model)
+    _dedup_moe_op_weights(model)
+    for param in list(model.parameters()):
+        _zero_tensor_storage(param)
+    for buffer in list(model.buffers()):
+        _zero_tensor_storage(buffer)
+
+
+def _materialize_meta_tensors(model: torch.nn.Module, device: str) -> None:
+    """Replace meta Parameters/buffers so ``Module.to(device)`` can run."""
+    for mod in model.modules():
+        for name, param in list(mod._parameters.items()):
+            if param is not None and param.is_meta:
+                mod._parameters[name] = nn.Parameter(
+                    torch.empty(param.shape, dtype=param.dtype, device=device),
+                    requires_grad=param.requires_grad,
+                )
+        for name, buf in list(mod._buffers.items()):
+            if buf is not None and buf.is_meta:
+                mod._buffers[name] = torch.empty(buf.shape, dtype=buf.dtype, device=device)
+
+
+def _move_model_to_device(model: torch.nn.Module, device: str) -> torch.nn.Module:
+    _materialize_meta_tensors(model, device)
+    return model.to(device)
+
+
+def _kv_cache_tensor_layer_names(kv_cache_tensor) -> list[str]:
+    """Layer names for a KV backing tensor (``.layers`` or legacy ``.shared_by``)."""
+    layers = getattr(kv_cache_tensor, "layers", None)
+    if layers is not None:
+        return layers
+    return kv_cache_tensor.shared_by
+
+
 class BucketingFailedException(Exception):
     pass
 
@@ -4925,7 +4995,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # Leaving dense models on host until the post-INC move restores the
                 # pre-#1590 behavior that convert() shrinks them first.
                 if not is_fake_hpu() and _model_has_moe_experts(self.model):
-                    self.model = self.model.to("hpu")
+                    self.model = _move_model_to_device(self.model, "hpu")
                     _rebind_moe_expert_weights(self.model)
                     htorch.core.mark_step()
                 if config.measure:
@@ -4946,7 +5016,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                                      "please validate quantization config file")
                 self._sync_shared_moe_gates()
                 if not is_fake_hpu():
-                    self.model = self.model.to("hpu")
+                    self.model = _move_model_to_device(self.model, "hpu")
                     _rebind_moe_expert_weights(self.model)
                     _move_remaining_tensors_to_device(self.model, "hpu")
                     _dedup_moe_op_weights(self.model)
@@ -4957,7 +5027,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
             self.model_memory_usage = m_inc.consumed_device_memory
             logger.info("Preparing model with INC took %.4f GB", self.model_memory_usage / float(2**30))
         elif not is_fake_hpu():
-            self.model = self.model.to("hpu")
+            self.model = _move_model_to_device(self.model, "hpu")
             htcore.mark_step()
 
         apply_model_specific_patches(self)
@@ -6752,7 +6822,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 torch.compile's aot_autograd does not support input mutations
                 on views with different dtypes (the raw buffer is bf16 but
                 GDN states may be float32)."""
-                for ln in kv_cache_tensor.layers:
+                for ln in _kv_cache_tensor_layer_names(kv_cache_tensor):
                     spec = _layer_spec.get(ln)
                     if isinstance(spec, FullAttentionSpec):
                         continue
@@ -6778,10 +6848,10 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                 # coalesced layers share one (standard Mamba2) spec; group 0 may
                 # be a smaller attention spec in hybrid models and under-pad the
                 # buffer, letting the last as_strided view run past the end.
-                raw_spec = _layer_spec[kv_cache_tensor.layers[0]]
+                raw_spec = _layer_spec[_kv_cache_tensor_layer_names(kv_cache_tensor)[0]]
                 size = kv_cache_tensor.size + raw_spec.page_size_bytes
                 tensor = torch.zeros(size // 2, dtype=torch.bfloat16, device=self.device)
-                for layer_name in kv_cache_tensor.layers:
+                for layer_name in _kv_cache_tensor_layer_names(kv_cache_tensor):
                     kv_caches[layer_name] = tensor
 
             for group_idx, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -6907,7 +6977,7 @@ class HPUModelRunner(HpuKVConnectorModelRunnerMixin):
                         pass
         else:  # non-hybrid scenario
             for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
-                for layer_name in kv_cache_tensor.layers:
+                for layer_name in _kv_cache_tensor_layer_names(kv_cache_tensor):
                     # Get the correct spec for this layer
                     kv_cache_spec = None
                     for group in kv_cache_config.kv_cache_groups:

@@ -81,8 +81,11 @@ def register_utils():
     import vllm_gaudi.utils  # noqa: F401
 
     vllm_gaudi.utils.patch_nixl_utils_for_hpu()
-    # Install the in-process EngineCore reconfigure hook only when
-    # multi-model mode is requested, to avoid heavy imports for all users.
+    # Worker host-memory teardown on EngineCore.shutdown (sleep L1 swap).
+    from vllm_gaudi.v1.engine.core_patch import install_gaudi_engine_shutdown_patch
+
+    install_gaudi_engine_shutdown_patch()
+    # Full reconfigure hook only for multi-model serving.
     import os
 
     if os.environ.get("VLLM_HPU_MULTI_MODEL_CONFIG"):
