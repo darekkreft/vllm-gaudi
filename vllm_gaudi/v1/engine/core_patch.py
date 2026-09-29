@@ -226,11 +226,32 @@ def _normalize_reconfigure_config_for_platform(config: VllmConfig) -> None:
         raise
 
 
+def _install_gaudi_engine_shutdown_patch(EngineCore: Any) -> None:
+    """Ensure EngineCore.shutdown() tears down HPU workers (host CPU weights)."""
+    if getattr(EngineCore, "_gaudi_shutdown_patched", False):
+        return
+
+    _original_engine_shutdown = getattr(EngineCore, "shutdown", None)
+
+    def gaudi_engine_shutdown(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            self.collective_rpc("shutdown")
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.warning("[gaudi] worker shutdown collective_rpc failed: %s", exc)
+        if _original_engine_shutdown is None:
+            return None
+        return _original_engine_shutdown(self, *args, **kwargs)
+
+    EngineCore.shutdown = gaudi_engine_shutdown
+    EngineCore._gaudi_shutdown_patched = True
+
+
 def install_engine_core_patch() -> None:
-    """Install a Gaudi-only EngineCore reconfigure hook."""
+    """Install Gaudi EngineCore hooks (in-process reconfigure + worker shutdown)."""
     from vllm.v1.engine.core import EngineCore
 
     if hasattr(EngineCore, "gaudi_reconfigure_engine"):
+        _install_gaudi_engine_shutdown_patch(EngineCore)
         return
 
     def gaudi_reconfigure_engine(
@@ -417,3 +438,4 @@ def install_engine_core_patch() -> None:
         }
 
     EngineCore.gaudi_reconfigure_engine = gaudi_reconfigure_engine
+    _install_gaudi_engine_shutdown_patch(EngineCore)

@@ -334,3 +334,19 @@ def patch_nixl_utils_for_hpu():
     if _nixlXferTelemetry is not None:
         _nixl_mod.nixlXferTelemetry = _nixlXferTelemetry  # type: ignore[attr-defined]
     logger.info("Patched vllm.distributed.nixl_utils for HPU (nixl._api)")
+
+
+def shutdown_llm(llm: Any) -> None:
+    """Shut down a v1 ``LLM`` so workers release HPU and host weight memory."""
+    if llm is None:
+        return
+    if hasattr(llm, "shutdown") and callable(llm.shutdown):
+        llm.shutdown()
+        return
+    engine = getattr(llm, "llm_engine", None) or getattr(getattr(llm, "model", None), "llm_engine", None)
+    if engine is not None and hasattr(engine, "shutdown") and callable(engine.shutdown):
+        engine.shutdown()
+        return
+    engine_core = getattr(engine, "engine_core", None) if engine is not None else None
+    if engine_core is not None and hasattr(engine_core, "shutdown"):
+        engine_core.shutdown()

@@ -40,6 +40,29 @@ from vllm_gaudi.extension.logger import logger as init_logger
 logger = init_logger()
 _QUANT_CONFIG_UNCHANGED = object()
 
+
+def _model_runner_stash_enabled() -> bool:
+    """When false, unload_model destroys the runner instead of keeping CPU weights."""
+    return os.environ.get("VLLM_HPU_STASH_MODEL_RUNNER", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+
+
+def _trim_host_memory() -> None:
+    gc.collect()
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    with contextlib.suppress(Exception):
+        torch.hpu.synchronize()
+        torch.hpu.empty_cache()
+    with contextlib.suppress(Exception):
+        torch._C._host_emptyCache()
+
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler import GrammarOutput, SchedulerOutput
 
@@ -115,6 +138,44 @@ class HPUWorker(WorkerBase):
             tuple(getattr(compile_cfg, "compile_sizes", ()) or ()),
         )
 
+    def _destroy_model_runner(self, runner: HPUModelRunner | None) -> None:
+        """Drop KV/state and release CPU weight tensors held by a model runner."""
+        if runner is None:
+            return
+        try:
+            runner.defragmenter = None
+            runner.kv_caches = []
+            vllm_config = getattr(runner, "vllm_config", None)
+            if vllm_config is not None:
+                forward_context = vllm_config.compilation_config.static_forward_context
+                for layer_name in forward_context:
+                    with contextlib.suppress(Exception):
+                        forward_context[layer_name].kv_cache = None
+            model = getattr(runner, "model", None)
+            if model is not None:
+                for param in model.parameters():
+                    param.data = torch.empty(0, device=param.device)
+                for buffer in model.buffers():
+                    buffer.data = torch.empty(0, device=buffer.device)
+                runner.model = None
+        except Exception as exc:
+            logger.warning("[HPUWorker] model runner teardown partial failure: %s", exc)
+        with contextlib.suppress(Exception):
+            getattr(runner, "shutdown_inc", lambda: None)()
+
+    def _evict_stashed_runners(self, except_key: tuple[object, ...] | None = None) -> None:
+        for key in list(self._model_runner_stash.keys()):
+            if except_key is not None and key == except_key:
+                continue
+            stashed = self._model_runner_state_stash.get(key, {})
+            cfg = stashed.get("vllm_config", self.vllm_config)
+            model_name = getattr(getattr(cfg, "model_config", None), "model", key)
+            logger.info("[HPUWorker] Evicting stashed runner for model: %s", model_name)
+            runner = self._model_runner_stash.pop(key)
+            self._model_runner_state_stash.pop(key, None)
+            self._destroy_model_runner(runner)
+        _trim_host_memory()
+
     def init_profiler(self):
         """Initialize the profiler."""
         torch_profiler_dir = os.getenv('VLLM_TORCH_PROFILER_DIR')
@@ -167,10 +228,15 @@ class HPUWorker(WorkerBase):
         self.init_profiler()
 
     def shutdown(self):
-        self._model_runner_stash.clear()
-        self._model_runner_state_stash.clear()
+        self._evict_stashed_runners()
         if self.model_runner is not None:
-            getattr(self.model_runner, 'shutdown_inc', lambda: None)()
+            self._destroy_model_runner(self.model_runner)
+            self.model_runner = None
+        self.model_sleeping = False
+        self.kv_cache_sleeping = False
+        self.kv_cache_config = None
+        HPUBucketingManager.deactivate()
+        _trim_host_memory()
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
@@ -191,26 +257,30 @@ class HPUWorker(WorkerBase):
             if self.model_runner is not None:
                 runner_config = getattr(self.model_runner, "vllm_config", self.vllm_config)
                 stash_key = self._runner_stash_key(runner_config)
-                logger.info("[HPUWorker] Stashing runner for model: %s", runner_config.model_config.model)
-                self._model_runner_stash[stash_key] = self.model_runner
-                self._model_runner_state_stash[stash_key] = {
-                    "vllm_config": runner_config,
-                    "model_sleeping": self.model_sleeping,
-                    "kv_cache_sleeping": self.kv_cache_sleeping,
-                    "kv_cache_config": self.kv_cache_config,
-                }
+                if not _model_runner_stash_enabled():
+                    logger.info(
+                        "[HPUWorker] VLLM_HPU_STASH_MODEL_RUNNER=0; destroying runner for model: %s",
+                        runner_config.model_config.model,
+                    )
+                    self._destroy_model_runner(self.model_runner)
+                else:
+                    if stash_key in self._model_runner_stash:
+                        self._destroy_model_runner(self._model_runner_stash.pop(stash_key))
+                        self._model_runner_state_stash.pop(stash_key, None)
+                    self._evict_stashed_runners(except_key=stash_key)
+                    logger.info("[HPUWorker] Stashing runner for model: %s", runner_config.model_config.model)
+                    self._model_runner_stash[stash_key] = self.model_runner
+                    self._model_runner_state_stash[stash_key] = {
+                        "vllm_config": runner_config,
+                        "model_sleeping": self.model_sleeping,
+                        "kv_cache_sleeping": self.kv_cache_sleeping,
+                        "kv_cache_config": self.kv_cache_config,
+                    }
                 self.model_runner = None
                 HPUBucketingManager.deactivate()
-            # Preserve previous KV cache metadata in stash for rollback.
             self.model_sleeping = False
             self.kv_cache_sleeping = False
-            gc.collect()
-            with contextlib.suppress(Exception):
-                import ctypes
-                libc = ctypes.CDLL("libc.so.6")
-                libc.malloc_trim(0)
-            with contextlib.suppress(Exception):
-                torch.hpu.synchronize()
+            _trim_host_memory()
         msg = f"Stashing model runner took {m.get_summary_string()}"
         logger.info(msg)
 
@@ -253,10 +323,13 @@ class HPUWorker(WorkerBase):
             if stash_key in self._model_runner_stash:
                 # Runner is alive with compiled graph cache intact;
                 # weights are on CPU — just move them back to HPU.
+                self._evict_stashed_runners(except_key=stash_key)
                 self.restore_stashed_model(vllm_config=vllm_config, restore_kv_cache=False)
                 self.kv_cache_sleeping = False
                 return
 
+            # Loading a different checkpoint: drop any stashed CPU weights first.
+            self._evict_stashed_runners()
             with set_current_vllm_config(vllm_config):
                 self.model_runner = HPUModelRunner(
                     vllm_config=vllm_config,
