@@ -342,19 +342,32 @@ def shutdown_llm(llm: Any) -> None:
 
     if llm is None:
         return
-    if hasattr(llm, "shutdown") and callable(llm.shutdown):
-        llm.shutdown()
-        return
+
     engine = getattr(llm, "llm_engine", None) or getattr(getattr(llm, "model", None), "llm_engine", None)
+
+    def _worker_shutdown_via_rpc(target: Any) -> None:
+        rpc = getattr(target, "collective_rpc", None)
+        if callable(rpc):
+            with contextlib.suppress(Exception):
+                rpc("shutdown")
+
+    # Always RPC workers first: upstream ``LLM.shutdown()`` often skips HPUWorker.shutdown().
+    if engine is not None:
+        _worker_shutdown_via_rpc(engine)
+        _worker_shutdown_via_rpc(getattr(engine, "engine_core", None))
+        _worker_shutdown_via_rpc(getattr(engine, "model_executor", None))
+
+    if hasattr(llm, "shutdown") and callable(llm.shutdown):
+        with contextlib.suppress(Exception):
+            llm.shutdown()
+        return
     if engine is None:
         return
-    # Tear down HPU workers before EngineCore drops executor / dist state.
-    if hasattr(engine, "collective_rpc") and callable(engine.collective_rpc):
-        with contextlib.suppress(Exception):
-            engine.collective_rpc("shutdown")
     if hasattr(engine, "shutdown") and callable(engine.shutdown):
-        engine.shutdown()
+        with contextlib.suppress(Exception):
+            engine.shutdown()
         return
     engine_core = getattr(engine, "engine_core", None)
     if engine_core is not None and hasattr(engine_core, "shutdown"):
-        engine_core.shutdown()
+        with contextlib.suppress(Exception):
+            engine_core.shutdown()
