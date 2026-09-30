@@ -336,6 +336,68 @@ def test_deserialize_reconfigure_config_accepts_valid_payload(monkeypatch):
     assert decoded.model_config.model == "test-model"
 
 
+def test_guard_rejects_reload_when_memory_not_released():
+    with pytest.raises(RuntimeError, match="memory was not released"):
+        core_patch._ensure_memory_released_for_reload(memory_before_mb=100.0, memory_after_unload_mb=60.0)
+
+
+def test_release_hpu_graph_wrapper_after_cpu_sleep_clears_graph_state():
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    runner = SimpleNamespace(model=SimpleNamespace(), graphed_buckets={"bucket": object()})
+
+    hw._release_hpu_graph_wrapper_after_cpu_sleep(runner)
+
+    assert runner.graphed_buckets == {}
+
+
+def test_release_runner_host_memory_clears_weights_without_finalizing_by_default():
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    class _FakeModel:
+
+        def parameters(self, recurse=True):
+            return [SimpleNamespace(data=torch.ones(2))]
+
+        def buffers(self, recurse=True):
+            return []
+
+    runner = SimpleNamespace(kv_caches=[object()], defragmenter=object(), model=_FakeModel())
+
+    hw._release_runner_host_memory(runner, finalize_inc=False)
+
+    assert runner.kv_caches == []
+    assert runner.defragmenter is None
+    assert runner.model is None
+
+
+def test_release_runner_host_memory_finalizes_inc_only_when_requested():
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    calls: list[str] = []
+    runner = SimpleNamespace(model=None, shutdown_inc=lambda: calls.append("shutdown_inc"))
+
+    hw._release_runner_host_memory(runner, finalize_inc=False)
+    assert calls == []
+
+    hw._release_runner_host_memory(runner, finalize_inc=True)
+    assert calls == ["shutdown_inc"]
+
+
+def test_worker_shutdown_releases_runner_host_memory_and_trims_allocator():
+    from vllm_gaudi.v1.worker.hpu_worker import HPUWorker
+
+    worker = HPUWorker.__new__(HPUWorker)
+    worker._model_runner_stash = {}
+    worker._model_runner_state_stash = {}
+    calls: list[str] = []
+    worker.model_runner = SimpleNamespace(model=None, shutdown_inc=lambda: calls.append("shutdown_inc"))
+
+    worker.shutdown()
+
+    assert calls == ["shutdown_inc"]
+
+
 def test_gaudi_reconfigure_engine_rolls_back_on_load_failure(monkeypatch):
 
     class _FakeNewConfig:

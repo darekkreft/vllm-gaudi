@@ -52,6 +52,188 @@ def setup_step_profiler(steps):
     return setup_profiler(warmup=0, active=active)
 
 
+def _release_hpu_device_cache() -> None:
+    """Force-empty the HPU device memory cache (GAUDISW-252377 sleep/swap OOM fix)."""
+    with contextlib.suppress(Exception):
+        torch.hpu.synchronize()
+        torch.hpu.empty_cache()
+        torch.hpu.synchronize()
+
+
+def _trim_host_python_allocator(release_hpu_device: bool = False) -> None:
+    """Return freed host RSS pages to the OS (GAUDISW-252377).
+
+    Tries glibc's ``malloc_trim`` first, but many QA/production images run with
+    ``LD_PRELOAD=libtcmalloc.so`` (gperftools), which replaces malloc/free entirely and
+    ignores ``malloc_trim`` \u2014 freed model weights then sit in tcmalloc's page heap
+    instead of being returned to the OS, so host RSS never drops after destroy. Also call
+    tcmalloc's own ``MallocExtension_ReleaseFreeMemory`` when that allocator is loaded.
+    """
+    gc.collect()
+    with contextlib.suppress(Exception):
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    with contextlib.suppress(Exception):
+        import ctypes
+        ctypes.CDLL("libtcmalloc.so.4").MallocExtension_ReleaseFreeMemory()
+    if release_hpu_device:
+        _release_hpu_device_cache()
+
+
+def _release_hpu_graph_wrapper_after_cpu_sleep(runner) -> None:
+    """Unwrap HPUGraph adapter shells so compiled-graph HPU memory can be freed.
+
+    On the sleep/swap path, leaving the HpuModelAdapter graph wrapper (and its
+    bucketing state) alive after the model moved to CPU keeps compiled-graph HPU
+    memory resident, which contributes to cgroup OOMs during model swap
+    (GAUDISW-252377).
+    """
+    if runner is None:
+        return
+    with contextlib.suppress(Exception):
+        from vllm_gaudi.v1.worker.hpu_model_runner import HpuModelAdapter
+        model = getattr(runner, "model", None)
+        if isinstance(model, HpuModelAdapter):
+            runner.model = model.model
+        else:
+            inner = runner.get_model()
+            if inner is not None and inner is not model:
+                runner.model = inner
+    with contextlib.suppress(Exception):
+        graphed = getattr(runner, "graphed_buckets", None)
+        if graphed is not None:
+            graphed.clear()
+    with contextlib.suppress(Exception):
+        HPUBucketingManager.deactivate()
+    _release_hpu_device_cache()
+
+
+_STRAY_ATTR_SKIP = frozenset({
+    "_parameters",
+    "_buffers",
+    "_modules",
+    "_non_persistent_buffers_set",
+    "_backward_pre_hooks",
+    "_backward_hooks",
+    "_is_full_backward_hook",
+    "_forward_hooks",
+    "_forward_hooks_with_kwargs",
+    "_forward_hooks_always_called",
+    "_forward_pre_hooks",
+    "_forward_pre_hooks_with_kwargs",
+    "_state_dict_hooks",
+    "_state_dict_pre_hooks",
+    "_load_state_dict_pre_hooks",
+    "_load_state_dict_post_hooks",
+})
+
+
+def _is_shared_cached_module(mod) -> bool:
+    """True for modules vLLM caches process-wide and reuses across LLM() instances.
+
+    vllm.model_executor.layers.rotary_embedding.get_rope() memoizes RotaryEmbedding
+    instances in a module-level _ROPE_DICT keyed only by rope params (head_size,
+    rotary_dim, max_position, base, dtype, ...) - not by model identity. In-process
+    model swap (GAUDISW-252377) can load a different model that happens to share the
+    same rope key, which then gets back the *same* cached RotaryEmbedding object. Its
+    buffers (cos_sin_cache) must never be zeroed on destroy, or that corruption leaks
+    into every future model load that hits the same cache key.
+    """
+    with contextlib.suppress(Exception):
+        from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+        if isinstance(mod, RotaryEmbeddingBase):
+            return True
+    return False
+
+
+def _drop_stray_tensor_refs(model) -> None:
+    """Clear plain-attribute tensor views that nn.Module.parameters()/buffers() can't reach.
+
+    Mirrors hpu_model_runner._move_remaining_tensors_to_device's module-attribute walk, but
+    clears instead of moving. Needed because e.g. MoeMatmul.weight/.bias (per-expert weight
+    views) and INC scale-inverse caches are plain tensor attributes, not registered
+    Parameters/buffers, so they keep the underlying storage resident after the registered
+    Parameters are zeroed (GAUDISW-252377 host memory retention on destroy).
+    """
+
+    def _clear(obj):
+        if isinstance(obj, (torch.nn.Module, torch.nn.Parameter)):
+            return obj
+        if isinstance(obj, torch.Tensor):
+            return torch.empty(0, device=obj.device)
+        if isinstance(obj, list):
+            return [_clear(item) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(_clear(item) for item in obj)
+        if isinstance(obj, dict):
+            return {k: _clear(v) for k, v in obj.items()}
+        return obj
+
+    cleared = 0
+    for mod in model.modules():
+        if _is_shared_cached_module(mod):
+            continue
+        for attr_name in list(mod.__dict__.keys()):
+            if attr_name in _STRAY_ATTR_SKIP:
+                continue
+            if attr_name in mod._parameters or attr_name in mod._buffers or attr_name in mod._modules:
+                continue
+            obj = mod.__dict__[attr_name]
+            if isinstance(obj, (torch.Tensor, list, tuple, dict)):
+                mod.__dict__[attr_name] = _clear(obj)
+
+
+def _release_runner_host_memory(runner, finalize_inc: bool = False, fallback_model=None) -> None:
+    """Drop the runner's model weights/buffers so stale host memory can't survive a swap.
+
+    ``finalize_inc=True`` additionally runs ``shutdown_inc()`` and empties the HPU
+    device cache; only safe to do once during a final worker shutdown — running it
+    before an in-process reload leaves the runner unusable for the next ``generate()``
+    (GAUDISW-252377).
+
+    ``fallback_model``: some QA harnesses zero the runner's registered parameters
+    and set ``runner.model = None`` themselves before triggering worker shutdown,
+    which hides the model from this function entirely and prevents the stray
+    plain-attribute tensor views (MoE weight views, INC scale caches) from ever
+    being cleared — they aren't reachable through ``model.parameters()``/
+    ``.buffers()`` and only this function's ``_drop_stray_tensor_refs`` walk
+    clears them. ``HPUWorker`` keeps its own reference to the loaded model
+    (independent of ``runner.model``) precisely so it can still be passed here.
+    """
+    if runner is None:
+        return
+    if hasattr(runner, "kv_caches"):
+        runner.kv_caches = []
+    if hasattr(runner, "defragmenter"):
+        runner.defragmenter = None
+    with contextlib.suppress(Exception):
+        from vllm_gaudi.v1.worker.hpu_model_runner import HpuModelAdapter
+        model = getattr(runner, "model", None)
+        if isinstance(model, HpuModelAdapter):
+            runner.model = model.model
+    model = getattr(runner, "model", None)
+    if model is None:
+        model = fallback_model
+    if model is not None:
+        for mod in model.modules():
+            if _is_shared_cached_module(mod):
+                continue
+            for tensor in list(mod.parameters(recurse=False)):
+                with contextlib.suppress(Exception):
+                    tensor.data = torch.empty(0, device=tensor.data.device)
+            for tensor in list(mod.buffers(recurse=False)):
+                with contextlib.suppress(Exception):
+                    tensor.data = torch.empty(0, device=tensor.data.device)
+        with contextlib.suppress(Exception):
+            _drop_stray_tensor_refs(model)
+    runner.model = None
+    if finalize_inc:
+        if hasattr(runner, "shutdown_inc"):
+            with contextlib.suppress(Exception):
+                runner.shutdown_inc()
+        _release_hpu_device_cache()
+
+
 class HPUWorker(WorkerBase):
 
     def __init__(
@@ -89,6 +271,9 @@ class HPUWorker(WorkerBase):
         self.kv_cache_config = None
         self._model_runner_stash: dict[tuple[object, ...], HPUModelRunner] = {}
         self._model_runner_state_stash: dict[tuple[object, ...], dict[str, Any]] = {}
+        # Own reference to the loaded model, independent of model_runner.model
+        # (GAUDISW-252377: some harnesses null runner.model before shutdown()).
+        self._loaded_model_ref: Any = None
 
     def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
@@ -170,7 +355,9 @@ class HPUWorker(WorkerBase):
         self._model_runner_stash.clear()
         self._model_runner_state_stash.clear()
         if self.model_runner is not None:
-            getattr(self.model_runner, 'shutdown_inc', lambda: None)()
+            _release_runner_host_memory(self.model_runner, finalize_inc=True, fallback_model=self._loaded_model_ref)
+        self._loaded_model_ref = None
+        _trim_host_python_allocator(release_hpu_device=True)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
@@ -264,6 +451,7 @@ class HPUWorker(WorkerBase):
                 )
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()  # type: ignore[union-attr]
+        self._loaded_model_ref = getattr(self.model_runner, "model", None)
 
         self.model_sleeping = False
         self.kv_cache_sleeping = False
@@ -287,6 +475,7 @@ class HPUWorker(WorkerBase):
 
         self.model_runner = self._model_runner_stash.pop(stash_key)
         stashed_state = self._model_runner_state_stash.pop(stash_key, {})
+        self._loaded_model_ref = getattr(self.model_runner, "model", None)
 
         bucketing_manager = getattr(self.model_runner, "bucketing_manager", None)
         if bucketing_manager is not None:
@@ -691,6 +880,7 @@ class HPUWorker(WorkerBase):
                 forward_context = self.vllm_config.compilation_config.static_forward_context
                 for layer_name in forward_context:
                     forward_context[layer_name].kv_cache = None
+                _release_hpu_graph_wrapper_after_cpu_sleep(self.model_runner)
                 gc.collect()
                 torch.hpu.synchronize()
             msg = f"Discarding KV cache for sleep mode took {m.get_summary_string()}"
