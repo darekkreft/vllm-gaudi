@@ -351,11 +351,29 @@ def shutdown_llm(llm: Any) -> None:
             with contextlib.suppress(Exception):
                 rpc("shutdown")
 
-    # Always RPC workers first: upstream ``LLM.shutdown()`` often skips HPUWorker.shutdown().
+    def _shutdown_driver_worker_direct() -> bool:
+        """V1 uni: ``llm.llm_engine.model_executor.driver_worker.worker`` (Sleep L1 harness path)."""
+        if engine is None:
+            return False
+        with contextlib.suppress(Exception):
+            me = getattr(engine, "model_executor", None)
+            if me is None:
+                return False
+            dw = getattr(me, "driver_worker", None)
+            if dw is None:
+                return False
+            worker = getattr(dw, "worker", None)
+            if worker is not None and callable(getattr(worker, "shutdown", None)):
+                worker.shutdown()
+                return True
+        return False
+
+    # Always tear down HPUWorker before upstream ``LLM.shutdown()`` (often skips host weight release).
     if engine is not None:
-        _worker_shutdown_via_rpc(engine)
-        _worker_shutdown_via_rpc(getattr(engine, "engine_core", None))
+        _shutdown_driver_worker_direct()
         _worker_shutdown_via_rpc(getattr(engine, "model_executor", None))
+        _worker_shutdown_via_rpc(getattr(engine, "engine_core", None))
+        _worker_shutdown_via_rpc(engine)
 
     if hasattr(llm, "shutdown") and callable(llm.shutdown):
         with contextlib.suppress(Exception):
