@@ -338,17 +338,70 @@ def test_deserialize_reconfigure_config_accepts_valid_payload(monkeypatch):
 
 def test_guard_rejects_reload_when_memory_not_released():
     with pytest.raises(RuntimeError, match="memory was not released"):
-        core_patch._ensure_memory_released_for_reload(memory_before_mb=100.0, memory_after_unload_mb=60.0)
+        core_patch._ensure_memory_released_for_reload(memory_before_mb=100.0, memory_after_unload_mb=95.0)
+
+
+@pytest.mark.parametrize(
+    ("memory_before_mb", "memory_after_unload_mb"),
+    [(100.0, 60.0), (None, 60.0), (100.0, None), (0.0, 0.0)],
+)
+def test_guard_allows_reload(memory_before_mb, memory_after_unload_mb):
+    core_patch._ensure_memory_released_for_reload(
+        memory_before_mb=memory_before_mb,
+        memory_after_unload_mb=memory_after_unload_mb,
+    )
+
+
+def test_gaudi_reconfigure_engine_restores_stash_when_guard_rejects_reload(monkeypatch):
+
+    class _FakeEngineCore:
+
+        def __init__(self):
+            self.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model="old-model"))
+            self.model_executor = SimpleNamespace(is_sleeping=True)
+            self.rpc_calls: list[str] = []
+
+        def pause_scheduler(self, mode: str, clear_cache: bool):
+            pass
+
+        def collective_rpc(self, method: str, kwargs=None):
+            self.rpc_calls.append(method)
+            if method == "get_hpu_used_memory_mb":
+                return [{"used": 100.0}]
+            if method == "unload_model":
+                return [{"stash_memory_after_mb": 100.0}]
+            if method == "restore_stashed_model":
+                return [{"restored": True}]
+            raise AssertionError(f"Unexpected RPC method: {method}")
+
+        def resume_scheduler(self):
+            pass
+
+    monkeypatch.setattr(core_patch, "_deserialize_reconfigure_config",
+                        lambda _: SimpleNamespace(model_config=SimpleNamespace(model="new-model")))
+    monkeypatch.setattr(core_patch, "_normalize_reconfigure_config_for_platform", Mock())
+
+    core_patch.install_engine_core_patch()
+
+    from vllm.v1.engine.core import EngineCore
+
+    fake_core = _FakeEngineCore()
+
+    with pytest.raises(RuntimeError, match="memory was not released"):
+        EngineCore.gaudi_reconfigure_engine(fake_core, b"payload")
+
+    assert "load_model" not in fake_core.rpc_calls
+    assert fake_core.rpc_calls[-1] == "restore_stashed_model"
 
 
 def test_release_hpu_graph_wrapper_after_cpu_sleep_clears_graph_state():
     from vllm_gaudi.v1.worker import hpu_worker as hw
 
-    runner = SimpleNamespace(model=SimpleNamespace(), graphed_buckets={"bucket": object()})
+    runner = SimpleNamespace(model=SimpleNamespace(), graphed_buckets={"bucket"})
 
     hw._release_hpu_graph_wrapper_after_cpu_sleep(runner)
 
-    assert runner.graphed_buckets == {}
+    assert runner.graphed_buckets == set()
 
 
 def test_release_runner_host_memory_clears_weights_without_finalizing_by_default():
@@ -384,18 +437,37 @@ def test_release_runner_host_memory_finalizes_inc_only_when_requested():
     assert calls == ["shutdown_inc"]
 
 
+def test_release_runner_host_memory_finalizes_inc_before_releasing_weights():
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    weight = torch.nn.Parameter(torch.ones(4))
+    model = torch.nn.Module()
+    model.register_parameter("weight", weight)
+    seen: list[tuple[object, int]] = []
+    runner = SimpleNamespace(model=model)
+    runner.shutdown_inc = lambda: seen.append((runner.model, weight.numel()))
+
+    hw._release_runner_host_memory(runner, finalize_inc=True)
+
+    assert seen == [(model, 4)]
+    assert weight.numel() == 0
+    assert runner.model is None
+
+
 def test_worker_shutdown_releases_runner_host_memory_and_trims_allocator():
     from vllm_gaudi.v1.worker.hpu_worker import HPUWorker
 
     worker = HPUWorker.__new__(HPUWorker)
     worker._model_runner_stash = {}
     worker._model_runner_state_stash = {}
+    worker._loaded_model_ref = None
     calls: list[str] = []
     worker.model_runner = SimpleNamespace(model=None, shutdown_inc=lambda: calls.append("shutdown_inc"))
 
     worker.shutdown()
 
     assert calls == ["shutdown_inc"]
+    assert worker._loaded_model_ref is None
 
 
 def test_gaudi_reconfigure_engine_rolls_back_on_load_failure(monkeypatch):
@@ -420,6 +492,7 @@ def test_gaudi_reconfigure_engine_rolls_back_on_load_failure(monkeypatch):
             self.model_executor = _FakeModelExecutor()
             self.resume_scheduler_calls = 0
             self.restore_called = False
+            self.used_memory_mb = 100.0
 
         def pause_scheduler(self, mode: str, clear_cache: bool):
             assert mode == "abort"
@@ -427,8 +500,9 @@ def test_gaudi_reconfigure_engine_rolls_back_on_load_failure(monkeypatch):
 
         def collective_rpc(self, method: str, kwargs=None):
             if method == "get_hpu_used_memory_mb":
-                return [{"used": 10.0}]
+                return [{"used": self.used_memory_mb}]
             if method == "unload_model":
+                self.used_memory_mb = 10.0
                 return [{"stash_memory_after_mb": 7.0}]
             if method == "load_model":
                 raise RuntimeError("load failed")

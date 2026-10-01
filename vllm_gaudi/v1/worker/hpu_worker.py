@@ -68,6 +68,8 @@ def _trim_host_python_allocator(release_hpu_device: bool = False) -> None:
     ignores ``malloc_trim`` \u2014 freed model weights then sit in tcmalloc's page heap
     instead of being returned to the OS, so host RSS never drops after destroy. Also call
     tcmalloc's own ``MallocExtension_ReleaseFreeMemory`` when that allocator is loaded.
+    The symbol is looked up in the already-loaded process image only: dlopen()ing
+    tcmalloc into a process that allocated with glibc malloc corrupts the heap.
     """
     gc.collect()
     with contextlib.suppress(Exception):
@@ -75,7 +77,9 @@ def _trim_host_python_allocator(release_hpu_device: bool = False) -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     with contextlib.suppress(Exception):
         import ctypes
-        ctypes.CDLL("libtcmalloc.so.4").MallocExtension_ReleaseFreeMemory()
+        release_free_memory = getattr(ctypes.CDLL(None), "MallocExtension_ReleaseFreeMemory", None)
+        if release_free_memory is not None:
+            release_free_memory()
     if release_hpu_device:
         _release_hpu_device_cache()
 
@@ -87,6 +91,10 @@ def _release_hpu_graph_wrapper_after_cpu_sleep(runner) -> None:
     bucketing state) alive after the model moved to CPU keeps compiled-graph HPU
     memory resident, which contributes to cgroup OOMs during model swap
     (GAUDISW-252377).
+
+    Destructive: ``wake_up()`` does not re-wrap the model, re-activate the bucketing
+    manager or restore ``graphed_buckets``, so only call this on a runner that is
+    about to be destroyed, never on one that will be woken up or restored from stash.
     """
     if runner is None:
         return
@@ -169,7 +177,6 @@ def _drop_stray_tensor_refs(model) -> None:
             return {k: _clear(v) for k, v in obj.items()}
         return obj
 
-    cleared = 0
     for mod in model.modules():
         if _is_shared_cached_module(mod):
             continue
@@ -202,6 +209,11 @@ def _release_runner_host_memory(runner, finalize_inc: bool = False, fallback_mod
     """
     if runner is None:
         return
+    # shutdown_inc() needs the intact model to finalize INC calibration (measurement
+    # dump), so it has to run before any weights are released.
+    if finalize_inc and hasattr(runner, "shutdown_inc"):
+        with contextlib.suppress(Exception):
+            runner.shutdown_inc()
     if hasattr(runner, "kv_caches"):
         runner.kv_caches = []
     if hasattr(runner, "defragmenter"):
@@ -228,9 +240,6 @@ def _release_runner_host_memory(runner, finalize_inc: bool = False, fallback_mod
             _drop_stray_tensor_refs(model)
     runner.model = None
     if finalize_inc:
-        if hasattr(runner, "shutdown_inc"):
-            with contextlib.suppress(Exception):
-                runner.shutdown_inc()
         _release_hpu_device_cache()
 
 
@@ -388,14 +397,11 @@ class HPUWorker(WorkerBase):
                 }
                 self.model_runner = None
                 HPUBucketingManager.deactivate()
+            self._loaded_model_ref = None
             # Preserve previous KV cache metadata in stash for rollback.
             self.model_sleeping = False
             self.kv_cache_sleeping = False
-            gc.collect()
-            with contextlib.suppress(Exception):
-                import ctypes
-                libc = ctypes.CDLL("libc.so.6")
-                libc.malloc_trim(0)
+            _trim_host_python_allocator()
             with contextlib.suppress(Exception):
                 torch.hpu.synchronize()
         msg = f"Stashing model runner took {m.get_summary_string()}"
@@ -880,7 +886,6 @@ class HPUWorker(WorkerBase):
                 forward_context = self.vllm_config.compilation_config.static_forward_context
                 for layer_name in forward_context:
                     forward_context[layer_name].kv_cache = None
-                _release_hpu_graph_wrapper_after_cpu_sleep(self.model_runner)
                 gc.collect()
                 torch.hpu.synchronize()
             msg = f"Discarding KV cache for sleep mode took {m.get_summary_string()}"

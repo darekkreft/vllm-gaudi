@@ -306,15 +306,8 @@ def install_engine_core_patch() -> None:
             except Exception as exc:  # pragma: no cover - best effort
                 logger.warning("Failed to sleep executor before reconfigure: %s", exc)
 
-            # Unload model put to sleep, reload new model on worker.
-            # Guard against a reload that happens before stale HPU memory is truly
-            # released; on sleep/swap paths this can leave old model state resident
-            # and trigger cgroup OOMs.
+            # Unload model put to sleep, reload new model on worker
             unload_result = self.collective_rpc("unload_model")
-            _ensure_memory_released_for_reload(
-                memory_before_mb=memory_before_mb,
-                memory_after_unload_mb=_collect_total_hpu_used_memory_mb(self),
-            )
             # Validate unload_result: collective_rpc returns a list of per-worker results.
             if not isinstance(unload_result, (list, tuple)) or len(unload_result) == 0:
                 logger.warning(
@@ -332,6 +325,12 @@ def install_engine_core_patch() -> None:
             stash_memory_after_mb = _sum_named_numeric_values(unload_result, "stash_memory_after_mb")
             stash_created = stash_memory_after_mb is not None
             memory_after_unload_mb = _collect_total_hpu_used_memory_mb(self)
+            # Must run after stash_created is set so a rejected reload rolls back to
+            # the stashed runner instead of leaving the worker without a model.
+            _ensure_memory_released_for_reload(
+                memory_before_mb=memory_before_mb,
+                memory_after_unload_mb=memory_after_unload_mb,
+            )
             load_kwargs: dict[str, Any] = {"vllm_config": new_config}
             if quant_config_path is not _QUANT_CONFIG_UNCHANGED:
                 load_kwargs["quant_config_path"] = quant_config_path
