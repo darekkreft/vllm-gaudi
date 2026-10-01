@@ -407,21 +407,17 @@ def test_release_hpu_graph_wrapper_after_cpu_sleep_clears_graph_state():
 def test_release_runner_host_memory_clears_weights_without_finalizing_by_default():
     from vllm_gaudi.v1.worker import hpu_worker as hw
 
-    class _FakeModel:
-
-        def parameters(self, recurse=True):
-            return [SimpleNamespace(data=torch.ones(2))]
-
-        def buffers(self, recurse=True):
-            return []
-
-    runner = SimpleNamespace(kv_caches=[object()], defragmenter=object(), model=_FakeModel())
+    weight = torch.nn.Parameter(torch.ones(2))
+    model = torch.nn.Module()
+    model.register_parameter("weight", weight)
+    runner = SimpleNamespace(kv_caches=[object()], defragmenter=object(), model=model)
 
     hw._release_runner_host_memory(runner, finalize_inc=False)
 
     assert runner.kv_caches == []
     assert runner.defragmenter is None
     assert runner.model is None
+    assert weight.numel() == 0
 
 
 def test_release_runner_host_memory_finalizes_inc_only_when_requested():
@@ -609,6 +605,7 @@ def test_gaudi_reconfigure_engine_skips_restore_without_stash_marker(monkeypatch
             self.model_executor = _FakeModelExecutor()
             self.resume_scheduler_calls = 0
             self.restore_called = False
+            self.used_memory_mb = 100.0
 
         def pause_scheduler(self, mode: str, clear_cache: bool):
             assert mode == "abort"
@@ -616,8 +613,9 @@ def test_gaudi_reconfigure_engine_skips_restore_without_stash_marker(monkeypatch
 
         def collective_rpc(self, method: str, kwargs=None):
             if method == "get_hpu_used_memory_mb":
-                return [{"used": 10.0}]
+                return [{"used": self.used_memory_mb}]
             if method == "unload_model":
+                self.used_memory_mb = 10.0
                 return []
             if method == "load_model":
                 raise RuntimeError("load failed")
