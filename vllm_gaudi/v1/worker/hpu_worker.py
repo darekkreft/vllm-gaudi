@@ -2,10 +2,15 @@
 """A GPU worker class."""
 import contextlib
 import gc
+import itertools
 import math
 import os
 import queue
+import socket
+import sys
+import threading
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
@@ -25,13 +30,14 @@ from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
 )
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group, get_world_group
 from vllm.utils.torch_utils import (STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size, set_random_seed)
 from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig, KVCacheSpec, MambaSpec)
 from vllm.v1.outputs import (DraftTokenIds, AsyncModelRunnerOutput, ModelRunnerOutput)
 from vllm.v1.worker.utils import bind_kv_cache
 from vllm_gaudi.extension.bucketing.common import HPUBucketingManager
 from vllm_gaudi.utils import is_fake_hpu
+from vllm_gaudi.v1.worker.host_headroom import host_guard_disabled, raise_if_reports_exceed_host_headroom
 from vllm_gaudi.v1.worker.hpu_model_runner import (HPUModelRunner, _GDN_MAMBA_TYPES, _rebind_moe_expert_weights)
 from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
@@ -50,6 +56,227 @@ def setup_step_profiler(steps):
     step_start, step_end = steps
     active = step_end - step_start + 1
     return setup_profiler(warmup=0, active=active)
+
+
+def _release_hpu_device_cache() -> None:
+    """Force-empty the HPU device memory cache."""
+    with contextlib.suppress(Exception):
+        torch.hpu.synchronize()
+        torch.hpu.empty_cache()
+        torch.hpu.synchronize()
+
+
+def _trim_host_python_allocator(release_hpu_device: bool = False) -> None:
+    """Return freed host RSS pages to the OS.
+
+    Tries glibc's ``malloc_trim`` first, but many deployment images run with
+    ``LD_PRELOAD=libtcmalloc.so`` (gperftools), which replaces malloc/free entirely and
+    ignores ``malloc_trim`` \u2014 freed model weights then sit in tcmalloc's page heap
+    instead of being returned to the OS, so host RSS never drops after destroy. Also call
+    tcmalloc's own ``MallocExtension_ReleaseFreeMemory`` when that allocator is loaded.
+    The symbol is looked up in the already-loaded process image only: dlopen()ing
+    tcmalloc into a process that allocated with glibc malloc corrupts the heap.
+    """
+    gc.collect()
+    with contextlib.suppress(Exception):
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    with contextlib.suppress(Exception):
+        import ctypes
+        release_free_memory = getattr(ctypes.CDLL(None), "MallocExtension_ReleaseFreeMemory", None)
+        if release_free_memory is not None:
+            release_free_memory()
+    if release_hpu_device:
+        _release_hpu_device_cache()
+
+
+def _process_is_exiting() -> bool:
+    # threading._shutdown() stops the main thread before any atexit handler or
+    # weakref.finalize callback runs, while sys.is_finalizing() is still False there,
+    # so this holds regardless of atexit registration order.
+    return sys.is_finalizing() or not threading.main_thread().is_alive()
+
+
+def _host_cgroup_headroom_bytes() -> int | None:
+    """Bytes the container cgroup can still allocate before an OOM kill, or None if unlimited.
+
+    Page cache (e.g. mmapped safetensors) is reclaimable, so it is not counted as used.
+    Shared memory (tmpfs, /dev/shm) is accounted as page cache but cannot be reclaimed
+    without swap, so it stays counted.
+    """
+    try:
+        cgroup_v2 = Path("/sys/fs/cgroup")
+        if (cgroup_v2 / "memory.max").exists():
+            raw_limit = (cgroup_v2 / "memory.max").read_text().strip()
+            if raw_limit == "max":
+                return None
+            limit = int(raw_limit)
+            usage = int((cgroup_v2 / "memory.current").read_text())
+            stat_path, cache_key, shmem_key = cgroup_v2 / "memory.stat", "file", "shmem"
+        else:
+            cgroup_v1 = Path("/sys/fs/cgroup/memory")
+            limit = int((cgroup_v1 / "memory.limit_in_bytes").read_text())
+            if limit >= 1 << 60:
+                return None
+            usage = int((cgroup_v1 / "memory.usage_in_bytes").read_text())
+            stat_path, cache_key, shmem_key = cgroup_v1 / "memory.stat", "total_cache", "total_shmem"
+        stat = {}
+        for line in stat_path.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key in (cache_key, shmem_key):
+                stat[key] = int(value)
+        reclaimable = max(0, stat.get(cache_key, 0) - stat.get(shmem_key, 0))
+        return max(0, limit - (usage - reclaimable))
+    except (OSError, ValueError):
+        return None
+
+
+def _device_resident_model_bytes(model: nn.Module) -> int:
+    """Bytes of parameter/buffer storage not on CPU, counting shared storages once."""
+    seen: set[int] = set()
+    total = 0
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        if tensor.device.type == "cpu":
+            continue
+        with contextlib.suppress(Exception):
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() in seen:
+                continue
+            seen.add(storage.data_ptr())
+            total += storage.nbytes()
+    return total
+
+
+_STRAY_ATTR_SKIP = frozenset({
+    "_parameters",
+    "_buffers",
+    "_modules",
+    "_non_persistent_buffers_set",
+    "_backward_pre_hooks",
+    "_backward_hooks",
+    "_is_full_backward_hook",
+    "_forward_hooks",
+    "_forward_hooks_with_kwargs",
+    "_forward_hooks_always_called",
+    "_forward_pre_hooks",
+    "_forward_pre_hooks_with_kwargs",
+    "_state_dict_hooks",
+    "_state_dict_pre_hooks",
+    "_load_state_dict_pre_hooks",
+    "_load_state_dict_post_hooks",
+})
+
+
+def _is_shared_cached_module(mod) -> bool:
+    """True for modules vLLM caches process-wide and reuses across LLM() instances.
+
+    vllm.model_executor.layers.rotary_embedding.get_rope() memoizes RotaryEmbedding
+    instances in a module-level _ROPE_DICT keyed only by rope params (head_size,
+    rotary_dim, max_position, base, dtype, ...) - not by model identity. In-process
+    model swap can load a different model that happens to share the
+    same rope key, which then gets back the *same* cached RotaryEmbedding object. Its
+    buffers (cos_sin_cache) must never be zeroed on destroy, or that corruption leaks
+    into every future model load that hits the same cache key.
+    """
+    with contextlib.suppress(Exception):
+        from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+        if isinstance(mod, RotaryEmbeddingBase):
+            return True
+    return False
+
+
+def _drop_stray_tensor_refs(model) -> None:
+    """Clear plain-attribute tensor views that nn.Module.parameters()/buffers() can't reach.
+
+    Mirrors hpu_model_runner._move_remaining_tensors_to_device's module-attribute walk, but
+    clears instead of moving. Needed because e.g. MoeMatmul.weight/.bias (per-expert weight
+    views) and INC scale-inverse caches are plain tensor attributes, not registered
+    Parameters/buffers, so they keep the underlying storage resident after the registered
+    Parameters are zeroed.
+    """
+
+    def _clear(obj):
+        if isinstance(obj, (torch.nn.Module, torch.nn.Parameter)):
+            return obj
+        if isinstance(obj, torch.Tensor):
+            return torch.empty(0, device=obj.device)
+        if isinstance(obj, list):
+            return [_clear(item) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(_clear(item) for item in obj)
+        if isinstance(obj, dict):
+            return {k: _clear(v) for k, v in obj.items()}
+        return obj
+
+    for mod in model.modules():
+        if _is_shared_cached_module(mod):
+            continue
+        for attr_name in list(mod.__dict__.keys()):
+            if attr_name in _STRAY_ATTR_SKIP:
+                continue
+            if attr_name in mod._parameters or attr_name in mod._buffers or attr_name in mod._modules:
+                continue
+            obj = mod.__dict__[attr_name]
+            if isinstance(obj, (torch.Tensor, list, tuple, dict)):
+                mod.__dict__[attr_name] = _clear(obj)
+
+
+def _release_runner_host_memory(runner, finalize_inc: bool = False, fallback_model=None) -> None:
+    """Drop the runner's model weights/buffers so stale host memory can't survive a swap.
+
+    ``finalize_inc=True`` additionally runs ``shutdown_inc()`` and empties the HPU
+    device cache; only safe to do once during a final worker shutdown — running it
+    before an in-process reload leaves the runner unusable for the next ``generate()``.
+
+    ``fallback_model``: callers may zero the runner's registered parameters
+    and set ``runner.model = None`` themselves before triggering worker shutdown,
+    which hides the model from this function entirely and prevents the stray
+    plain-attribute tensor views (MoE weight views, INC scale caches) from ever
+    being cleared — they aren't reachable through ``model.parameters()``/
+    ``.buffers()`` and only this function's ``_drop_stray_tensor_refs`` walk
+    clears them. ``HPUWorker`` keeps its own reference to the loaded model
+    (independent of ``runner.model``) precisely so it can still be passed here.
+    """
+    if runner is None:
+        return
+    # shutdown_inc() needs the intact model to finalize INC calibration (measurement
+    # dump), so it has to run before any weights are released, and against the
+    # fallback model when a caller already cleared runner.model.
+    if finalize_inc and hasattr(runner, "shutdown_inc"):
+        borrowed = getattr(runner, "model", None) is None and fallback_model is not None
+        if borrowed:
+            runner.model = fallback_model
+        with contextlib.suppress(Exception):
+            runner.shutdown_inc()
+        if borrowed:
+            runner.model = None
+    if hasattr(runner, "kv_caches"):
+        runner.kv_caches = []
+    if hasattr(runner, "defragmenter"):
+        runner.defragmenter = None
+    with contextlib.suppress(Exception):
+        from vllm_gaudi.v1.worker.hpu_model_runner import HpuModelAdapter
+        model = getattr(runner, "model", None)
+        if isinstance(model, HpuModelAdapter):
+            runner.model = model.model
+    model = getattr(runner, "model", None)
+    if model is None:
+        model = fallback_model
+    if model is not None:
+        for mod in model.modules():
+            if _is_shared_cached_module(mod):
+                continue
+            for tensor in list(mod.parameters(recurse=False)):
+                with contextlib.suppress(Exception):
+                    tensor.data = torch.empty(0, device=tensor.data.device)
+            for tensor in list(mod.buffers(recurse=False)):
+                with contextlib.suppress(Exception):
+                    tensor.data = torch.empty(0, device=tensor.data.device)
+        with contextlib.suppress(Exception):
+            _drop_stray_tensor_refs(model)
+    runner.model = None
+    if finalize_inc:
+        _release_hpu_device_cache()
 
 
 class HPUWorker(WorkerBase):
@@ -89,6 +316,12 @@ class HPUWorker(WorkerBase):
         self.kv_cache_config = None
         self._model_runner_stash: dict[tuple[object, ...], HPUModelRunner] = {}
         self._model_runner_state_stash: dict[tuple[object, ...], dict[str, Any]] = {}
+        # Own reference to the loaded model, independent of model_runner.model,
+        # which callers may clear before shutdown(); shutdown() still needs it to
+        # finalize INC and drop stray tensor views. As a consequence, clearing
+        # model_runner.model alone does not free the model before shutdown() or
+        # unload_model().
+        self._loaded_model_ref: Any = None
 
     def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
         self.vllm_config = vllm_config
@@ -169,8 +402,17 @@ class HPUWorker(WorkerBase):
     def shutdown(self):
         self._model_runner_stash.clear()
         self._model_runner_state_stash.clear()
+        if _process_is_exiting():
+            # The HPU device may already be released here; allocating or synchronizing
+            # on it re-creates the device and segfaults. The OS reclaims memory anyway.
+            if self.model_runner is not None:
+                getattr(self.model_runner, 'shutdown_inc', lambda: None)()
+            self._loaded_model_ref = None
+            return
         if self.model_runner is not None:
-            getattr(self.model_runner, 'shutdown_inc', lambda: None)()
+            _release_runner_host_memory(self.model_runner, finalize_inc=True, fallback_model=self._loaded_model_ref)
+        self._loaded_model_ref = None
+        _trim_host_python_allocator(release_hpu_device=True)
 
     def get_kv_cache_spec(self) -> dict[str, KVCacheSpec]:
         return self.model_runner.get_kv_cache_spec()  # type: ignore[union-attr]
@@ -201,14 +443,11 @@ class HPUWorker(WorkerBase):
                 }
                 self.model_runner = None
                 HPUBucketingManager.deactivate()
+            self._loaded_model_ref = None
             # Preserve previous KV cache metadata in stash for rollback.
             self.model_sleeping = False
             self.kv_cache_sleeping = False
-            gc.collect()
-            with contextlib.suppress(Exception):
-                import ctypes
-                libc = ctypes.CDLL("libc.so.6")
-                libc.malloc_trim(0)
+            _trim_host_python_allocator()
             with contextlib.suppress(Exception):
                 torch.hpu.synchronize()
         msg = f"Stashing model runner took {m.get_summary_string()}"
@@ -264,6 +503,7 @@ class HPUWorker(WorkerBase):
                 )
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()  # type: ignore[union-attr]
+        self._loaded_model_ref = getattr(self.model_runner, "model", None)
 
         self.model_sleeping = False
         self.kv_cache_sleeping = False
@@ -287,6 +527,7 @@ class HPUWorker(WorkerBase):
 
         self.model_runner = self._model_runner_stash.pop(stash_key)
         stashed_state = self._model_runner_state_stash.pop(stash_key, {})
+        self._loaded_model_ref = getattr(self.model_runner, "model", None)
 
         bucketing_manager = getattr(self.model_runner, "bucketing_manager", None)
         if bucketing_manager is not None:
@@ -650,6 +891,33 @@ class HPUWorker(WorkerBase):
         except Exception:
             return None
 
+    def check_sleep_host_headroom(self) -> dict[str, Any]:
+        """Report host bytes this worker needs to move its model to CPU, and the cgroup headroom."""
+        model = None if self.model_sleeping or self.model_runner is None else getattr(self.model_runner, "model", None)
+        return {
+            "host": socket.gethostname(),
+            "required_bytes": _device_resident_model_bytes(model) if model is not None else 0,
+            "headroom_bytes": _host_cgroup_headroom_bytes(),
+        }
+
+    def _ensure_sleep_host_headroom(self) -> None:
+        """Raise on every worker if the model would not fit in host memory after sleep.
+
+        Collective when world_size > 1: every worker must call it, and the reports are
+        gathered before any worker starts moving its shard, so all workers measure the
+        same headroom and either all proceed or all raise.
+        """
+        if host_guard_disabled():
+            return
+        _trim_host_python_allocator()
+        reports = [self.check_sleep_host_headroom()]
+        world_size = getattr(getattr(self.vllm_config, "parallel_config", None), "world_size", 1) or 1
+        if world_size > 1 and torch.distributed.is_initialized():
+            gathered: list[Any] = [None] * world_size
+            torch.distributed.all_gather_object(gathered, reports[0], group=get_world_group().cpu_group)
+            reports = gathered
+        raise_if_reports_exceed_host_headroom(reports, action="Sleep", outcome="the model stays on HPU")
+
     def sleep(self, level: int = 1) -> None:
         """Put the worker into sleep mode to reduce memory usage. Unlike GPU workers that use custom
         memory allocators, HPU workers use a simpler approach of moving model to CPU and clearing KV cache.
@@ -661,6 +929,8 @@ class HPUWorker(WorkerBase):
             logger.warning("Currently, HPU does not support level 2 sleep mode. Performing level 1 operations")
         assert not htorch.utils.internal.is_lazy(
         ) or self.model_config.enforce_eager, "Sleep mode is supported only for torch.compile mode"
+
+        self._ensure_sleep_host_headroom()
 
         # Handle model - if model was loaded move it to CPU
         if self.model_sleeping:

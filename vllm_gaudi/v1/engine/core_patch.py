@@ -21,8 +21,23 @@ from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_gaudi.v1.worker.host_headroom import host_guard_disabled, raise_if_reports_exceed_host_headroom
+
 logger = init_logger(__name__)
 _QUANT_CONFIG_UNCHANGED = object()
+
+
+def _ensure_host_headroom_for_sleep(worker_reports: Any) -> None:
+    """Refuse to sleep the current model when moving it to CPU would exceed the host cgroup.
+
+    Sleep copies the model weights into host memory, so this is where a model swap can be
+    OOM-killed.
+    """
+    if host_guard_disabled():
+        return
+    raise_if_reports_exceed_host_headroom(worker_reports,
+                                          action="Reconfigure",
+                                          outcome="the current model stays loaded")
 
 
 def _collect_numeric_values(value: Any) -> list[float]:
@@ -261,6 +276,14 @@ def install_engine_core_patch() -> None:
             _normalize_reconfigure_config_for_platform(new_config)
             logger.info("[gaudi_reconfigure] start: target_model=%s", new_config.model_config.model)
             memory_before_mb = _collect_total_hpu_used_memory_mb(self)
+
+            if not getattr(self.model_executor, "is_sleeping", False):
+                try:
+                    headroom_reports = self.collective_rpc("check_sleep_host_headroom")
+                except Exception as exc:  # pragma: no cover - best effort
+                    logger.warning("[gaudi_reconfigure] host headroom check unavailable: %s", exc)
+                    headroom_reports = None
+                _ensure_host_headroom_for_sleep(headroom_reports)
 
             # Pause scheduling and clear caches to avoid mixed state.
             try:
