@@ -96,12 +96,15 @@ def _trim_host_memory() -> None:
 
         libc = ctypes.CDLL("libc.so.6")
         libc.malloc_trim(0)
-    # QA pods often use LD_PRELOAD=libtcmalloc; malloc_trim alone may not drop VmRSS.
+    # Images that LD_PRELOAD libtcmalloc ignore malloc_trim. Look the symbol up in the
+    # loaded process image only: dlopen()ing tcmalloc into a glibc-malloc process
+    # corrupts the heap.
     with contextlib.suppress(Exception):
         import ctypes
 
-        tc = ctypes.CDLL("libtcmalloc.so.4")
-        tc.MallocExtension_ReleaseFreeMemory()
+        release_free_memory = getattr(ctypes.CDLL(None), "MallocExtension_ReleaseFreeMemory", None)
+        if release_free_memory is not None:
+            release_free_memory()
     _trim_hpu_device_memory()
 
 
@@ -308,6 +311,10 @@ class HPUWorker(WorkerBase):
         """Drop KV/state and release CPU weight tensors held by a model runner."""
         if runner is None:
             return
+        # shutdown_inc() needs the intact model to finalize INC calibration
+        # (measurement dump), so it has to run before any weights are released.
+        with contextlib.suppress(Exception):
+            getattr(runner, "shutdown_inc", lambda: None)()
         _release_runner_inference_workspace(runner)
         try:
             runner.defragmenter = None
@@ -338,8 +345,6 @@ class HPUWorker(WorkerBase):
             runner.model = None
         except Exception as exc:
             logger.warning("[HPUWorker] model runner teardown partial failure: %s", exc)
-        with contextlib.suppress(Exception):
-            getattr(runner, "shutdown_inc", lambda: None)()
 
     def _evict_stashed_runners(self, except_key: tuple[object, ...] | None = None) -> None:
         for key in list(self._model_runner_stash.keys()):
