@@ -57,7 +57,7 @@ def setup_step_profiler(steps):
 
 
 def _release_hpu_device_cache() -> None:
-    """Force-empty the HPU device memory cache (GAUDISW-252377 sleep/swap OOM fix)."""
+    """Force-empty the HPU device memory cache."""
     with contextlib.suppress(Exception):
         torch.hpu.synchronize()
         torch.hpu.empty_cache()
@@ -65,9 +65,9 @@ def _release_hpu_device_cache() -> None:
 
 
 def _trim_host_python_allocator(release_hpu_device: bool = False) -> None:
-    """Return freed host RSS pages to the OS (GAUDISW-252377).
+    """Return freed host RSS pages to the OS.
 
-    Tries glibc's ``malloc_trim`` first, but many QA/production images run with
+    Tries glibc's ``malloc_trim`` first, but many deployment images run with
     ``LD_PRELOAD=libtcmalloc.so`` (gperftools), which replaces malloc/free entirely and
     ignores ``malloc_trim`` \u2014 freed model weights then sit in tcmalloc's page heap
     instead of being returned to the OS, so host RSS never drops after destroy. Also call
@@ -200,7 +200,7 @@ def _is_shared_cached_module(mod) -> bool:
     vllm.model_executor.layers.rotary_embedding.get_rope() memoizes RotaryEmbedding
     instances in a module-level _ROPE_DICT keyed only by rope params (head_size,
     rotary_dim, max_position, base, dtype, ...) - not by model identity. In-process
-    model swap (GAUDISW-252377) can load a different model that happens to share the
+    model swap can load a different model that happens to share the
     same rope key, which then gets back the *same* cached RotaryEmbedding object. Its
     buffers (cos_sin_cache) must never be zeroed on destroy, or that corruption leaks
     into every future model load that hits the same cache key.
@@ -219,7 +219,7 @@ def _drop_stray_tensor_refs(model) -> None:
     clears instead of moving. Needed because e.g. MoeMatmul.weight/.bias (per-expert weight
     views) and INC scale-inverse caches are plain tensor attributes, not registered
     Parameters/buffers, so they keep the underlying storage resident after the registered
-    Parameters are zeroed (GAUDISW-252377 host memory retention on destroy).
+    Parameters are zeroed.
     """
 
     def _clear(obj):
@@ -253,10 +253,9 @@ def _release_runner_host_memory(runner, finalize_inc: bool = False, fallback_mod
 
     ``finalize_inc=True`` additionally runs ``shutdown_inc()`` and empties the HPU
     device cache; only safe to do once during a final worker shutdown — running it
-    before an in-process reload leaves the runner unusable for the next ``generate()``
-    (GAUDISW-252377).
+    before an in-process reload leaves the runner unusable for the next ``generate()``.
 
-    ``fallback_model``: some QA harnesses zero the runner's registered parameters
+    ``fallback_model``: callers may zero the runner's registered parameters
     and set ``runner.model = None`` themselves before triggering worker shutdown,
     which hides the model from this function entirely and prevents the stray
     plain-attribute tensor views (MoE weight views, INC scale caches) from ever
@@ -344,8 +343,8 @@ class HPUWorker(WorkerBase):
         self.kv_cache_config = None
         self._model_runner_stash: dict[tuple[object, ...], HPUModelRunner] = {}
         self._model_runner_state_stash: dict[tuple[object, ...], dict[str, Any]] = {}
-        # Own reference to the loaded model, independent of model_runner.model
-        # (GAUDISW-252377: some harnesses null runner.model before shutdown()).
+        # Own reference to the loaded model, independent of model_runner.model,
+        # which callers may clear before shutdown().
         self._loaded_model_ref: Any = None
 
     def _apply_vllm_config(self, vllm_config: VllmConfig) -> None:
