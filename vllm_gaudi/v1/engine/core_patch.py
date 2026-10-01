@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections import deque
+import os
 import queue
 import time
 from typing import Any
@@ -25,33 +26,25 @@ logger = init_logger(__name__)
 _QUANT_CONFIG_UNCHANGED = object()
 
 
-def _ensure_memory_released_for_reload(
-    *,
-    memory_before_mb: float | None,
-    memory_after_unload_mb: float | None,
-    memory_release_threshold_ratio: float = 0.1,
-) -> None:
-    """Guard against reloads that happen before stale HPU memory is released.
+def _ensure_host_headroom_for_sleep(worker_reports: Any) -> None:
+    """Refuse to sleep the current model when moving it to CPU would exceed the host cgroup.
 
-    On the sleep/swap path, leaving old model and KV-cache state resident while
-    loading a replacement model can trigger cgroup OOMs. This helper ensures we
-    do not proceed with the new load unless the unload step actually frees a
-    meaningful amount of memory.
+    Sleep copies the model weights into host memory, so this is where a model swap can be
+    OOM-killed. Workers share one cgroup and move their shards concurrently, so the
+    requirement is summed across workers and compared with the smallest reported headroom.
     """
-    if memory_before_mb is None or memory_after_unload_mb is None:
+    if os.environ.get("VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD", "0") == "1":
         return
-
-    released_mb = max(0.0, memory_before_mb - memory_after_unload_mb)
-    if memory_before_mb <= 0.0:
+    if not isinstance(worker_reports, (list, tuple)):
         return
-
-    released_ratio = released_mb / memory_before_mb
-    if released_ratio < memory_release_threshold_ratio:
-        raise RuntimeError(
-            "Reload aborted: model memory was not released before reload "
-            f"(before={memory_before_mb:.1f}MB, after_unload={memory_after_unload_mb:.1f}MB, "
-            f"released={released_mb:.1f}MB, ratio={released_ratio:.3f})"
-        )
+    reports = [r for r in worker_reports if isinstance(r, dict)]
+    required = sum(int(r.get("required_bytes") or 0) for r in reports)
+    headrooms = [int(r["headroom_bytes"]) for r in reports if isinstance(r.get("headroom_bytes"), int)]
+    if required <= 0 or not headrooms or min(headrooms) >= required:
+        return
+    raise RuntimeError("Reconfigure aborted: insufficient host memory to sleep the current model "
+                       f"(required={required / 2**30:.1f}GiB, cgroup_headroom={min(headrooms) / 2**30:.1f}GiB); "
+                       "the current model stays loaded. Set VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD=1 to bypass.")
 
 
 def _collect_numeric_values(value: Any) -> list[float]:
@@ -291,6 +284,14 @@ def install_engine_core_patch() -> None:
             logger.info("[gaudi_reconfigure] start: target_model=%s", new_config.model_config.model)
             memory_before_mb = _collect_total_hpu_used_memory_mb(self)
 
+            if not getattr(self.model_executor, "is_sleeping", False):
+                try:
+                    headroom_reports = self.collective_rpc("check_sleep_host_headroom")
+                except Exception as exc:  # pragma: no cover - best effort
+                    logger.warning("[gaudi_reconfigure] host headroom check unavailable: %s", exc)
+                    headroom_reports = None
+                _ensure_host_headroom_for_sleep(headroom_reports)
+
             # Pause scheduling and clear caches to avoid mixed state.
             try:
                 self.pause_scheduler(mode="abort", clear_cache=True)
@@ -325,12 +326,6 @@ def install_engine_core_patch() -> None:
             stash_memory_after_mb = _sum_named_numeric_values(unload_result, "stash_memory_after_mb")
             stash_created = stash_memory_after_mb is not None
             memory_after_unload_mb = _collect_total_hpu_used_memory_mb(self)
-            # Must run after stash_created is set so a rejected reload rolls back to
-            # the stashed runner instead of leaving the worker without a model.
-            _ensure_memory_released_for_reload(
-                memory_before_mb=memory_before_mb,
-                memory_after_unload_mb=memory_after_unload_mb,
-            )
             load_kwargs: dict[str, Any] = {"vllm_config": new_config}
             if quant_config_path is not _QUANT_CONFIG_UNCHANGED:
                 load_kwargs["quant_config_path"] = quant_config_path

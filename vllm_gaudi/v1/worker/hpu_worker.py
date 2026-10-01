@@ -1,11 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """A GPU worker class."""
+import atexit
 import contextlib
 import gc
+import itertools
 import math
 import os
 import queue
+import sys
 from contextlib import contextmanager
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
@@ -84,35 +88,89 @@ def _trim_host_python_allocator(release_hpu_device: bool = False) -> None:
         _release_hpu_device_cache()
 
 
+_atexit_started = False
+
+
+def _mark_atexit_started() -> None:
+    global _atexit_started
+    _atexit_started = True
+
+
+atexit.register(_mark_atexit_started)
+
+
+def _process_is_exiting() -> bool:
+    return _atexit_started or sys.is_finalizing()
+
+
+def _host_cgroup_headroom_bytes() -> int | None:
+    """Bytes the container cgroup can still allocate before an OOM kill, or None if unlimited.
+
+    Page cache (e.g. mmapped safetensors) is reclaimable, so it is not counted as used.
+    """
+    try:
+        cgroup_v2 = Path("/sys/fs/cgroup")
+        if (cgroup_v2 / "memory.max").exists():
+            raw_limit = (cgroup_v2 / "memory.max").read_text().strip()
+            if raw_limit == "max":
+                return None
+            limit = int(raw_limit)
+            usage = int((cgroup_v2 / "memory.current").read_text())
+            stat_path, cache_key = cgroup_v2 / "memory.stat", "file"
+        else:
+            cgroup_v1 = Path("/sys/fs/cgroup/memory")
+            limit = int((cgroup_v1 / "memory.limit_in_bytes").read_text())
+            if limit >= 1 << 60:
+                return None
+            usage = int((cgroup_v1 / "memory.usage_in_bytes").read_text())
+            stat_path, cache_key = cgroup_v1 / "memory.stat", "total_cache"
+        cache = 0
+        for line in stat_path.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key == cache_key:
+                cache = int(value)
+                break
+        return max(0, limit - (usage - cache))
+    except (OSError, ValueError):
+        return None
+
+
+def _device_resident_model_bytes(model: nn.Module) -> int:
+    """Bytes of parameter/buffer storage not on CPU, counting shared storages once."""
+    seen: set[int] = set()
+    total = 0
+    for tensor in itertools.chain(model.parameters(), model.buffers()):
+        if tensor.device.type == "cpu":
+            continue
+        with contextlib.suppress(Exception):
+            storage = tensor.untyped_storage()
+            if storage.data_ptr() in seen:
+                continue
+            seen.add(storage.data_ptr())
+            total += storage.nbytes()
+    return total
+
+
+def _raise_if_insufficient_host_headroom(*, required_bytes: int, headroom_bytes: int | None) -> None:
+    if headroom_bytes is None or required_bytes <= 0 or headroom_bytes >= required_bytes:
+        return
+    raise RuntimeError("Sleep aborted: insufficient host memory to move the model to CPU "
+                       f"(required={required_bytes / 2**30:.1f}GiB, "
+                       f"cgroup_headroom={headroom_bytes / 2**30:.1f}GiB); the model stays on HPU. "
+                       "Set VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD=1 to bypass.")
+
+
 def _release_hpu_graph_wrapper_after_cpu_sleep(runner) -> None:
-    """Unwrap HPUGraph adapter shells so compiled-graph HPU memory can be freed.
+    """Return cached HPU allocator blocks after the model moved to CPU.
 
-    On the sleep/swap path, leaving the HpuModelAdapter graph wrapper (and its
-    bucketing state) alive after the model moved to CPU keeps compiled-graph HPU
-    memory resident, which contributes to cgroup OOMs during model swap
-    (GAUDISW-252377).
-
-    Destructive: ``wake_up()`` does not re-wrap the model, re-activate the bucketing
-    manager or restore ``graphed_buckets``, so only call this on a runner that is
-    about to be destroyed, never on one that will be woken up or restored from stash.
+    Sleep mode requires torch.compile mode, where the model is held by a plain
+    HpuModelAdapter without HPU graphs, so the adapter owns no device memory. The
+    adapter, ``graphed_buckets`` and the active bucketing manager are deliberately
+    left in place: the forward pass needs all of them, and ``wake_up()`` /
+    ``restore_stashed_model()`` reuse the runner as-is.
     """
     if runner is None:
         return
-    with contextlib.suppress(Exception):
-        from vllm_gaudi.v1.worker.hpu_model_runner import HpuModelAdapter
-        model = getattr(runner, "model", None)
-        if isinstance(model, HpuModelAdapter):
-            runner.model = model.model
-        else:
-            inner = runner.get_model()
-            if inner is not None and inner is not model:
-                runner.model = inner
-    with contextlib.suppress(Exception):
-        graphed = getattr(runner, "graphed_buckets", None)
-        if graphed is not None:
-            graphed.clear()
-    with contextlib.suppress(Exception):
-        HPUBucketingManager.deactivate()
     _release_hpu_device_cache()
 
 
@@ -210,10 +268,16 @@ def _release_runner_host_memory(runner, finalize_inc: bool = False, fallback_mod
     if runner is None:
         return
     # shutdown_inc() needs the intact model to finalize INC calibration (measurement
-    # dump), so it has to run before any weights are released.
+    # dump), so it has to run before any weights are released, and against the
+    # fallback model when a caller already cleared runner.model.
     if finalize_inc and hasattr(runner, "shutdown_inc"):
+        borrowed = getattr(runner, "model", None) is None and fallback_model is not None
+        if borrowed:
+            runner.model = fallback_model
         with contextlib.suppress(Exception):
             runner.shutdown_inc()
+        if borrowed:
+            runner.model = None
     if hasattr(runner, "kv_caches"):
         runner.kv_caches = []
     if hasattr(runner, "defragmenter"):
@@ -363,6 +427,13 @@ class HPUWorker(WorkerBase):
     def shutdown(self):
         self._model_runner_stash.clear()
         self._model_runner_state_stash.clear()
+        if _process_is_exiting():
+            # The HPU device may already be released here; allocating or synchronizing
+            # on it re-creates the device and segfaults. The OS reclaims memory anyway.
+            if self.model_runner is not None:
+                getattr(self.model_runner, 'shutdown_inc', lambda: None)()
+            self._loaded_model_ref = None
+            return
         if self.model_runner is not None:
             _release_runner_host_memory(self.model_runner, finalize_inc=True, fallback_model=self._loaded_model_ref)
         self._loaded_model_ref = None
@@ -845,6 +916,27 @@ class HPUWorker(WorkerBase):
         except Exception:
             return None
 
+    def check_sleep_host_headroom(self) -> dict[str, int | None]:
+        """Report host bytes this worker needs to move its model to CPU, and the cgroup headroom."""
+        model = None if self.model_sleeping or self.model_runner is None else getattr(
+            self.model_runner, "model", None)
+        return {
+            "required_bytes": _device_resident_model_bytes(model) if model is not None else 0,
+            "headroom_bytes": _host_cgroup_headroom_bytes(),
+        }
+
+    def _ensure_sleep_host_headroom(self) -> None:
+        if os.environ.get("VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD", "0") == "1":
+            return
+        _trim_host_python_allocator()
+        report = self.check_sleep_host_headroom()
+        # All workers move their shards to CPU concurrently within the same cgroup.
+        world_size = getattr(getattr(self.vllm_config, "parallel_config", None), "world_size", 1) or 1
+        _raise_if_insufficient_host_headroom(
+            required_bytes=(report["required_bytes"] or 0) * world_size,
+            headroom_bytes=report["headroom_bytes"],
+        )
+
     def sleep(self, level: int = 1) -> None:
         """Put the worker into sleep mode to reduce memory usage. Unlike GPU workers that use custom
         memory allocators, HPU workers use a simpler approach of moving model to CPU and clearing KV cache.
@@ -856,6 +948,10 @@ class HPUWorker(WorkerBase):
             logger.warning("Currently, HPU does not support level 2 sleep mode. Performing level 1 operations")
         assert not htorch.utils.internal.is_lazy(
         ) or self.model_config.enforce_eager, "Sleep mode is supported only for torch.compile mode"
+
+        if not self.model_sleeping and self.model_runner is not None and getattr(self.model_runner, "model",
+                                                                                 None) is not None:
+            self._ensure_sleep_host_headroom()
 
         # Handle model - if model was loaded move it to CPU
         if self.model_sleeping:

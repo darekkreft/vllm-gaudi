@@ -336,46 +336,74 @@ def test_deserialize_reconfigure_config_accepts_valid_payload(monkeypatch):
     assert decoded.model_config.model == "test-model"
 
 
-def test_guard_rejects_reload_when_memory_not_released():
-    with pytest.raises(RuntimeError, match="memory was not released"):
-        core_patch._ensure_memory_released_for_reload(memory_before_mb=100.0, memory_after_unload_mb=95.0)
+_GIB = 2**30
+
+
+def test_host_headroom_guard_rejects_sleep_when_cgroup_is_too_small(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD", raising=False)
+    reports = [
+        {"required_bytes": 40 * _GIB, "headroom_bytes": 70 * _GIB},
+        {"required_bytes": 40 * _GIB, "headroom_bytes": 60 * _GIB},
+    ]
+
+    with pytest.raises(RuntimeError, match="insufficient host memory to sleep"):
+        core_patch._ensure_host_headroom_for_sleep(reports)
 
 
 @pytest.mark.parametrize(
-    ("memory_before_mb", "memory_after_unload_mb"),
-    [(100.0, 60.0), (None, 60.0), (100.0, None), (0.0, 0.0)],
+    "reports",
+    [
+        [{"required_bytes": 40 * _GIB, "headroom_bytes": 60 * _GIB}],
+        [{"required_bytes": 40 * _GIB, "headroom_bytes": None}],
+        [{"required_bytes": 0, "headroom_bytes": 0}],
+        None,
+        [object()],
+    ],
 )
-def test_guard_allows_reload(memory_before_mb, memory_after_unload_mb):
-    core_patch._ensure_memory_released_for_reload(
-        memory_before_mb=memory_before_mb,
-        memory_after_unload_mb=memory_after_unload_mb,
-    )
+def test_host_headroom_guard_allows_sleep(monkeypatch, reports):
+    monkeypatch.delenv("VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD", raising=False)
+    core_patch._ensure_host_headroom_for_sleep(reports)
 
 
-def test_gaudi_reconfigure_engine_restores_stash_when_guard_rejects_reload(monkeypatch):
+def test_host_headroom_guard_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD", "1")
+    core_patch._ensure_host_headroom_for_sleep([{"required_bytes": 2 * _GIB, "headroom_bytes": _GIB}])
+
+
+def test_gaudi_reconfigure_engine_keeps_current_model_when_host_headroom_is_insufficient(monkeypatch):
+    monkeypatch.delenv("VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD", raising=False)
+
+    class _FakeModelExecutor:
+
+        def __init__(self):
+            self.is_sleeping = False
+            self.sleep_called = False
+
+        def sleep(self, level: int = 1):
+            self.sleep_called = True
 
     class _FakeEngineCore:
 
         def __init__(self):
             self.vllm_config = SimpleNamespace(model_config=SimpleNamespace(model="old-model"))
-            self.model_executor = SimpleNamespace(is_sleeping=True)
+            self.model_executor = _FakeModelExecutor()
             self.rpc_calls: list[str] = []
+            self.paused = False
+            self.resume_scheduler_calls = 0
 
         def pause_scheduler(self, mode: str, clear_cache: bool):
-            pass
+            self.paused = True
 
         def collective_rpc(self, method: str, kwargs=None):
             self.rpc_calls.append(method)
             if method == "get_hpu_used_memory_mb":
                 return [{"used": 100.0}]
-            if method == "unload_model":
-                return [{"stash_memory_after_mb": 100.0}]
-            if method == "restore_stashed_model":
-                return [{"restored": True}]
+            if method == "check_sleep_host_headroom":
+                return [{"required_bytes": 64 * _GIB, "headroom_bytes": 10 * _GIB}]
             raise AssertionError(f"Unexpected RPC method: {method}")
 
         def resume_scheduler(self):
-            pass
+            self.resume_scheduler_calls += 1
 
     monkeypatch.setattr(core_patch, "_deserialize_reconfigure_config",
                         lambda _: SimpleNamespace(model_config=SimpleNamespace(model="new-model")))
@@ -387,21 +415,75 @@ def test_gaudi_reconfigure_engine_restores_stash_when_guard_rejects_reload(monke
 
     fake_core = _FakeEngineCore()
 
-    with pytest.raises(RuntimeError, match="memory was not released"):
+    with pytest.raises(RuntimeError, match="insufficient host memory to sleep"):
         EngineCore.gaudi_reconfigure_engine(fake_core, b"payload")
 
-    assert "load_model" not in fake_core.rpc_calls
-    assert fake_core.rpc_calls[-1] == "restore_stashed_model"
+    assert not fake_core.paused
+    assert not fake_core.model_executor.sleep_called
+    assert not {"unload_model", "load_model", "restore_stashed_model"} & set(fake_core.rpc_calls)
+    assert fake_core.resume_scheduler_calls >= 1
+    assert fake_core.vllm_config.model_config.model == "old-model"
 
 
-def test_release_hpu_graph_wrapper_after_cpu_sleep_clears_graph_state():
+def test_worker_sleep_host_guard_raises_before_moving_model(monkeypatch):
     from vllm_gaudi.v1.worker import hpu_worker as hw
 
-    runner = SimpleNamespace(model=SimpleNamespace(), graphed_buckets={"bucket"})
+    monkeypatch.delenv("VLLM_GAUDI_SKIP_SLEEP_HOST_GUARD", raising=False)
+    monkeypatch.setattr(hw, "_host_cgroup_headroom_bytes", lambda: 10 * _GIB)
+    monkeypatch.setattr(hw, "_device_resident_model_bytes", lambda _model: 8 * _GIB)
+
+    worker = hw.HPUWorker.__new__(hw.HPUWorker)
+    worker.model_sleeping = False
+    worker.model_runner = SimpleNamespace(model=object())
+    worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(world_size=2))
+
+    with pytest.raises(RuntimeError, match="insufficient host memory to move the model to CPU"):
+        worker._ensure_sleep_host_headroom()
+
+    worker.vllm_config = SimpleNamespace(parallel_config=SimpleNamespace(world_size=1))
+    worker._ensure_sleep_host_headroom()
+
+
+def test_worker_reports_no_host_requirement_when_model_already_sleeping(monkeypatch):
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    monkeypatch.setattr(hw, "_host_cgroup_headroom_bytes", lambda: 5 * _GIB)
+    worker = hw.HPUWorker.__new__(hw.HPUWorker)
+    worker.model_sleeping = True
+    worker.model_runner = SimpleNamespace(model=object())
+
+    assert worker.check_sleep_host_headroom() == {"required_bytes": 0, "headroom_bytes": 5 * _GIB}
+
+
+def test_host_cgroup_headroom_excludes_page_cache(monkeypatch, tmp_path):
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    (tmp_path / "memory.max").write_text(str(100 * _GIB))
+    (tmp_path / "memory.current").write_text(str(70 * _GIB))
+    (tmp_path / "memory.stat").write_text(f"anon {20 * _GIB}\nfile {50 * _GIB}\n")
+    real_path = hw.Path
+    monkeypatch.setattr(hw, "Path", lambda p: tmp_path if p == "/sys/fs/cgroup" else real_path(p))
+
+    assert hw._host_cgroup_headroom_bytes() == 80 * _GIB
+
+    (tmp_path / "memory.max").write_text("max")
+    assert hw._host_cgroup_headroom_bytes() is None
+
+
+def test_release_hpu_graph_wrapper_after_cpu_sleep_keeps_runner_usable(monkeypatch):
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    adapter = object()
+    graphed = {"bucket"}
+    deactivate = Mock()
+    monkeypatch.setattr(hw.HPUBucketingManager, "deactivate", deactivate)
+    runner = SimpleNamespace(model=adapter, graphed_buckets=graphed)
 
     hw._release_hpu_graph_wrapper_after_cpu_sleep(runner)
 
-    assert runner.graphed_buckets == set()
+    assert runner.model is adapter
+    assert runner.graphed_buckets == {"bucket"}
+    deactivate.assert_not_called()
 
 
 def test_release_runner_host_memory_clears_weights_without_finalizing_by_default():
@@ -448,6 +530,45 @@ def test_release_runner_host_memory_finalizes_inc_before_releasing_weights():
     assert seen == [(model, 4)]
     assert weight.numel() == 0
     assert runner.model is None
+
+
+def test_release_runner_host_memory_finalizes_inc_with_fallback_model_when_runner_model_cleared():
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(torch.ones(4)))
+    seen: list[object] = []
+    runner = SimpleNamespace(model=None)
+    runner.shutdown_inc = lambda: seen.append(runner.model)
+
+    hw._release_runner_host_memory(runner, finalize_inc=True, fallback_model=model)
+
+    assert seen == [model]
+    assert model.weight.numel() == 0
+    assert runner.model is None
+
+
+def test_worker_shutdown_at_process_exit_only_finalizes_inc(monkeypatch):
+    from vllm_gaudi.v1.worker import hpu_worker as hw
+
+    monkeypatch.setattr(hw, "_process_is_exiting", lambda: True)
+    release = Mock()
+    trim = Mock()
+    monkeypatch.setattr(hw, "_release_runner_host_memory", release)
+    monkeypatch.setattr(hw, "_trim_host_python_allocator", trim)
+    worker = hw.HPUWorker.__new__(hw.HPUWorker)
+    worker._model_runner_stash = {}
+    worker._model_runner_state_stash = {}
+    worker._loaded_model_ref = object()
+    calls: list[str] = []
+    worker.model_runner = SimpleNamespace(model=object(), shutdown_inc=lambda: calls.append("shutdown_inc"))
+
+    worker.shutdown()
+
+    assert calls == ["shutdown_inc"]
+    release.assert_not_called()
+    trim.assert_not_called()
+    assert worker._loaded_model_ref is None
 
 
 def test_worker_shutdown_releases_runner_host_memory_and_trims_allocator():
