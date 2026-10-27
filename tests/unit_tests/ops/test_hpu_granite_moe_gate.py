@@ -33,3 +33,20 @@ def test_granite_moe_gate_is_bf16_replicated_linear(default_vllm_config, dist_in
     assert type(gate) is ReplicatedLinear
     assert gate.bias is None
     assert gate.weight.dtype == torch.bfloat16
+
+
+def test_granite_moe_gate_ignores_extra_gate_linear_args(default_vllm_config, dist_init, monkeypatch):
+    import vllm.model_executor.models.granitemoe as granite_moe
+
+    monkeypatch.setattr(granite_moe, "GateLinear", granite_moe.GateLinear)
+    patches._patch_granite_moe_gate()
+
+    gate = granite_moe.GateLinear(64,
+                                  8,
+                                  params_dtype=torch.bfloat16,
+                                  out_dtype=torch.float32,
+                                  force_fp32_compute=True,
+                                  prefix="model.layers.0.block_sparse_moe.gate")
+
+    assert type(gate) is ReplicatedLinear
+    assert gate.weight.dtype == torch.bfloat16

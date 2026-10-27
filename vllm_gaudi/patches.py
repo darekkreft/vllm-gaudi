@@ -383,6 +383,13 @@ def _hpu_granite_moe_gate(
     """bf16 ``ReplicatedLinear`` router for ``GraniteMoeMoE`` on HPU."""
     from vllm.model_executor.layers.linear import ReplicatedLinear
 
+    if kwargs:
+        from vllm.logger import init_logger
+
+        init_logger(__name__).warning_once(
+            "GraniteMoeMoE passes %s to GateLinear; the HPU bf16 router ignores them (GAUDISW-254074).",
+            ", ".join(sorted(kwargs)))
+
     return ReplicatedLinear(
         input_size,
         output_size,
@@ -429,6 +436,10 @@ def _patch_granite_moe_gate() -> None:
         return
 
     _granite_moe_mod.GateLinear = _hpu_granite_moe_gate
+
+    from vllm.logger import init_logger
+
+    init_logger(__name__).info("HPU: GraniteMoeMoE gate patched to bf16 ReplicatedLinear (GAUDISW-254074).")
 
 
 def _hpu_mamba_bind_kv_cache(self, kv_cache) -> None:
